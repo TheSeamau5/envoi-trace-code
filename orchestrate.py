@@ -386,7 +386,7 @@ sandbox_image = (
     .pip_install(
         "envoi @ git+https://github.com/TheSeamau5/envoi.git",
         "httpx>=0.27.0",
-        "opencode-ai>=0.1.0b0",
+        "opencode-ai>=0.1.0a36",
         "pydantic>=2.0.0",
         "mcp>=1.0.0",
     )
