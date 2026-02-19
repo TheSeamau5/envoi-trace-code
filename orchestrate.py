@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 
 app = modal.App("envoi-trace")
 
-DEFAULT_MODEL = "opencode/glm-5-free"
+DEFAULT_MODEL = "opencode/claude-sonnet-4"
 
 PROMPT = (Path(__file__).parent / "prompts" / "system.txt").read_text()
 SETUP_SH = (Path(__file__).parent / "sandbox" / "setup.sh").read_text()
@@ -81,6 +81,18 @@ def truncate_text(text: str, limit: int = 4000) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "\n...[truncated]"
+
+
+def parse_http_status(output: str) -> tuple[str, int | None]:
+    if "HTTP_STATUS:" not in output:
+        return output, None
+    body, status_part = output.rsplit("HTTP_STATUS:", 1)
+    status_line = status_part.strip().splitlines()[0] if status_part.strip() else ""
+    try:
+        status = int(status_line)
+    except ValueError:
+        status = None
+    return body.rstrip(), status
 
 
 # ---------------------------------------------------------------------------
@@ -213,11 +225,21 @@ def get_bucket() -> str:
     return os.environ.get("AWS_S3_BUCKET", "envoi-trace-data")
 
 
+def model_to_json(model: BaseModel) -> str:
+    if hasattr(model, "model_dump_json"):
+        return model.model_dump_json()
+    if hasattr(model, "json"):
+        return model.json()
+    if hasattr(model, "dict"):
+        return json.dumps(model.dict())
+    return json.dumps(model)
+
+
 def append_jsonl_record(trajectory_id: str, record: TurnRecord) -> None:
     s3 = get_s3_client()
     bucket = get_bucket()
     key = f"trajectories/{trajectory_id}/trajectory.jsonl"
-    line = record.model_dump_json() + "\n"
+    line = model_to_json(record) + "\n"
     try:
         existing = s3.get_object(Bucket=bucket, Key=key)
         existing_data = existing["Body"].read()
@@ -309,18 +331,30 @@ async def sandbox_run(sandbox: modal.Sandbox, cmd: str, timeout: int = 60) -> tu
     return exit_code, stdout, stderr
 
 
-async def sandbox_write_file(sandbox: modal.Sandbox, path: str, content: str) -> None:
+async def sandbox_write_file(
+    sandbox: modal.Sandbox,
+    path: str,
+    content: str,
+    ensure_dir: bool = True,
+) -> None:
     """Write a file inside the sandbox using Modal's filesystem API."""
-    parent = str(Path(path).parent)
-    await sandbox_run(sandbox, f"mkdir -p '{parent}'")
+    if ensure_dir:
+        parent = str(Path(path).parent)
+        await sandbox_run(sandbox, f"mkdir -p '{parent}'")
     async with await sandbox.open.aio(path, "w") as f:
         await f.write.aio(content)
 
 
-async def sandbox_write_bytes(sandbox: modal.Sandbox, path: str, data: bytes) -> None:
+async def sandbox_write_bytes(
+    sandbox: modal.Sandbox,
+    path: str,
+    data: bytes,
+    ensure_dir: bool = True,
+) -> None:
     """Write binary data to a file inside the sandbox."""
-    parent = str(Path(path).parent)
-    await sandbox_run(sandbox, f"mkdir -p '{parent}'")
+    if ensure_dir:
+        parent = str(Path(path).parent)
+        await sandbox_run(sandbox, f"mkdir -p '{parent}'")
     async with await sandbox.open.aio(path, "wb") as f:
         await f.write.aio(data)
 
@@ -351,29 +385,83 @@ async def debug_endpoint_json(
     limit: int = 4000,
 ) -> None:
     print(f"[debug] {label} -> {url}")
-    exit_code, stdout, stderr = await sandbox_run(sandbox, f"curl -sf {url}", timeout=15)
+    exit_code, stdout, stderr = await sandbox_run(
+        sandbox, f"curl -sS -w '\nHTTP_STATUS:%{{http_code}}' {url}", timeout=15
+    )
+    body, status = parse_http_status(stdout)
     if exit_code != 0:
         print(f"[debug] {label} exit_code={exit_code}")
+    if status is not None:
+        print(f"[debug] {label} http_status={status}")
     if stderr:
         print(f"[debug] {label} stderr:\n{stderr}")
-    if not stdout.strip():
+    if not body.strip():
         print(f"[debug] {label} no output")
         return
     try:
-        data = json.loads(stdout)
+        data = json.loads(body)
         data = redact_secrets(data)
         text = json.dumps(data, indent=2)
     except json.JSONDecodeError:
-        text = stdout
+        text = body
     print(truncate_text(text, limit=limit))
+
+
+async def get_provider_connected(sandbox: modal.Sandbox) -> list[str]:
+    exit_code, stdout, stderr = await sandbox_run(
+        sandbox,
+        "curl -sS -w '\nHTTP_STATUS:%{http_code}' http://localhost:4096/provider",
+        timeout=15,
+    )
+    body, status = parse_http_status(stdout)
+    if exit_code != 0 or (status is not None and status >= 400):
+        print(f"[provider] fetch failed exit={exit_code} status={status}")
+        if stderr:
+            print(f"[provider] stderr:\n{stderr}")
+        return []
+    try:
+        data = json.loads(body) if body.strip() else {}
+        connected = data.get("connected", [])
+        print(f"[provider] connected={connected}")
+        return connected
+    except json.JSONDecodeError:
+        print("[provider] failed to parse JSON")
+        return []
+
+
+async def ensure_opencode_auth(sandbox: modal.Sandbox, api_key: str) -> bool:
+    if not api_key:
+        print("[auth] OPENCODE_API_KEY missing, cannot set auth")
+        return False
+    payload = json.dumps({"apiKey": api_key})
+    await sandbox_write_file(sandbox, "/tmp/opencode_auth.json", payload)
+    exit_code, stdout, stderr = await sandbox_run(
+        sandbox,
+        "curl -sS -w '\nHTTP_STATUS:%{http_code}' -X PUT "
+        "http://localhost:4096/auth/opencode "
+        "-H 'Content-Type: application/json' -d @/tmp/opencode_auth.json",
+        timeout=15,
+    )
+    body, status = parse_http_status(stdout)
+    print(f"[auth] PUT /auth/opencode exit={exit_code} status={status}")
+    if stderr:
+        print(f"[auth] stderr:\n{stderr}")
+    if body.strip():
+        print(truncate_text(body, limit=1000))
+    return exit_code == 0 and status is not None and 200 <= status < 300
 
 
 async def get_messages(sandbox: modal.Sandbox, session_id: str) -> list[dict[str, Any]]:
     _, stdout, _ = await sandbox_run(
-        sandbox, f"curl -sf http://localhost:4096/session/{session_id}/message", timeout=30
+        sandbox,
+        f"curl -sS -w '\nHTTP_STATUS:%{{http_code}}' http://localhost:4096/session/{session_id}/message",
+        timeout=30,
     )
+    body, status = parse_http_status(stdout)
+    if status is not None and status >= 400:
+        print(f"[get_messages] http_status={status}")
     try:
-        data = json.loads(stdout)
+        data = json.loads(body) if body.strip() else []
         summary = summarize_messages(data)
         print(
             f"[get_messages] count={summary['count']} last_role={summary['last_role']} "
@@ -391,29 +479,47 @@ async def send_user_message(
     message: str,
     model: str,
 ) -> None:
-    payload = json.dumps({"model": model, "parts": [{"type": "text", "text": message}]})
+    payload = json.dumps({"parts": [{"type": "text", "text": message}]})
     await sandbox_write_file(sandbox, "/tmp/msg_payload.json", payload)
     print(f"[send_user_message] sending prompt_async model={model}")
     exit_code, stdout, stderr = await sandbox_run(
         sandbox,
-        f"curl -sf -X POST http://localhost:4096/session/{session_id}/prompt_async "
+        f"curl -sS -w '\nHTTP_STATUS:%{{http_code}}' -X POST "
+        f"http://localhost:4096/session/{session_id}/prompt_async "
         f"-H 'Content-Type: application/json' -d @/tmp/msg_payload.json",
         timeout=120,
     )
-    print(f"[send_user_message] exit={exit_code} stdout_len={len(stdout)} stderr_len={len(stderr)}")
+    body, status = parse_http_status(stdout)
+    print(
+        f"[send_user_message] exit={exit_code} http_status={status} "
+        f"body_len={len(body)} stderr_len={len(stderr)}"
+    )
+    if body.strip():
+        print(truncate_text(body, limit=2000))
+    if exit_code != 0 or (status is not None and status >= 400):
+        await send_blocking_message_background(sandbox, session_id, "/tmp/msg_payload.json")
 
 
 async def create_session(sandbox: modal.Sandbox, title: str = "C Compiler Build") -> str | None:
     payload = json.dumps({"title": title})
     await sandbox_write_file(sandbox, "/tmp/create_session.json", payload)
-    _, stdout, _ = await sandbox_run(
+    exit_code, stdout, stderr = await sandbox_run(
         sandbox,
-        "curl -sf -X POST http://localhost:4096/session "
+        "curl -sS -w '\nHTTP_STATUS:%{http_code}' -X POST http://localhost:4096/session "
         "-H 'Content-Type: application/json' -d @/tmp/create_session.json",
         timeout=30,
     )
+    body, status = parse_http_status(stdout)
+    print(
+        f"[create_session] exit={exit_code} http_status={status} "
+        f"body_len={len(body)} stderr_len={len(stderr)}"
+    )
+    if body.strip():
+        print(truncate_text(body, limit=2000))
+    if exit_code != 0 or (status is not None and status >= 400):
+        return None
     try:
-        data = json.loads(stdout)
+        data = json.loads(body)
         return data.get("id")
     except json.JSONDecodeError:
         print("[create_session] failed to parse JSON")
@@ -426,18 +532,43 @@ async def send_initial_prompt(
     prompt: str,
     model: str,
 ) -> None:
-    payload = json.dumps({"model": model, "parts": [{"type": "text", "text": prompt}]})
+    payload = json.dumps({"parts": [{"type": "text", "text": prompt}]})
     await sandbox_write_file(sandbox, "/tmp/prompt_payload.json", payload)
     print(f"[send_initial_prompt] sending prompt_async model={model}")
     exit_code, stdout, stderr = await sandbox_run(
         sandbox,
-        f"curl -sf -X POST http://localhost:4096/session/{session_id}/prompt_async "
+        f"curl -sS -w '\nHTTP_STATUS:%{{http_code}}' -X POST "
+        f"http://localhost:4096/session/{session_id}/prompt_async "
         f"-H 'Content-Type: application/json' -d @/tmp/prompt_payload.json",
         timeout=120,
     )
+    body, status = parse_http_status(stdout)
     print(
-        f"[send_initial_prompt] exit={exit_code} stdout_len={len(stdout)} stderr_len={len(stderr)}"
+        f"[send_initial_prompt] exit={exit_code} http_status={status} "
+        f"body_len={len(body)} stderr_len={len(stderr)}"
     )
+    if body.strip():
+        print(truncate_text(body, limit=2000))
+    if exit_code != 0 or (status is not None and status >= 400):
+        await send_blocking_message_background(sandbox, session_id, "/tmp/prompt_payload.json")
+
+
+async def send_blocking_message_background(
+    sandbox: modal.Sandbox,
+    session_id: str,
+    payload_path: str,
+) -> None:
+    log_path = f"/tmp/opencode_message_{session_id}.log"
+    script_path = f"/tmp/send_message_{session_id}.sh"
+    script = (
+        "#!/bin/bash\n"
+        f"curl -sS -X POST http://localhost:4096/session/{session_id}/message "
+        f"-H 'Content-Type: application/json' -d @{payload_path} "
+        f"> {log_path} 2>&1\n"
+    )
+    await sandbox_write_file(sandbox, script_path, script)
+    await sandbox_run(sandbox, f"nohup bash {script_path} >/dev/null 2>&1 &", timeout=10)
+    print(f"[send_blocking_message_background] started, log at {log_path}")
 
 
 def detect_new_turn(
@@ -495,6 +626,13 @@ async def tail_sandbox_logs(sandbox: modal.Sandbox) -> None:
     )
     if stdout.strip():
         print(stdout)
+    _, msg_logs, _ = await sandbox_run(
+        sandbox,
+        "ls -1 /tmp/opencode_message_*.log 2>/dev/null | tail -n 3 | xargs -I{} sh -c 'echo \"==> {} <==\"; tail -n 10 {}' || true",
+        timeout=10,
+    )
+    if msg_logs.strip():
+        print(msg_logs)
     _, proc_out, _ = await sandbox_run(
         sandbox,
         "if [ -f /tmp/envoi.pid ]; then ps -o pid,etimes,cmd -p $(cat /tmp/envoi.pid); fi; "
@@ -555,11 +693,19 @@ async def run_trajectory(
             raise RuntimeError("Failed to create OpenCode session")
 
         print(f"OpenCode session: {session_id}")
+        await debug_endpoint_json(sandbox, "config", "http://localhost:4096/config")
+        await debug_endpoint_json(sandbox, "provider", "http://localhost:4096/provider")
+
+        connected = await get_provider_connected(sandbox)
+        if "opencode" not in connected:
+            print("[provider] opencode not connected, attempting auth")
+            await ensure_opencode_auth(sandbox, opencode_api_key)
+            await debug_endpoint_json(sandbox, "provider", "http://localhost:4096/provider")
+            connected = await get_provider_connected(sandbox)
+
         await send_initial_prompt(sandbox, session_id, PROMPT, resolved_model)
         await tail_sandbox_logs(sandbox)
 
-        await debug_endpoint_json(sandbox, "config", "http://localhost:4096/config")
-        await debug_endpoint_json(sandbox, "provider", "http://localhost:4096/provider")
         await debug_endpoint_json(sandbox, "session_status", "http://localhost:4096/session/status")
         await debug_endpoint_json(sandbox, "session", f"http://localhost:4096/session/{session_id}")
         await debug_endpoint_json(
@@ -760,17 +906,26 @@ async def setup_sandbox(
     print("[setup] writing opencode config")
     await sandbox_write_file(sandbox, "/workspace/opencode.jsonc", config_override)
 
+    env_paths = [f"/environment/{rel}" for rel in ENVIRONMENT_PY_FILES]
+    env_paths += [f"/environment/{rel}" for rel in ENVIRONMENT_C_FILES]
+    env_paths += [f"/environment/{rel}" for rel in ENVIRONMENT_TXT_FILES]
+    env_dirs = sorted({str(Path(p).parent) for p in env_paths})
+    if env_dirs:
+        print(f"[setup] precreating env dirs: {len(env_dirs)}")
+        dir_args = " ".join([f"'{d}'" for d in env_dirs])
+        await sandbox_run(sandbox, f"mkdir -p {dir_args}")
+
     print(f"[setup] uploading env py files: {len(ENVIRONMENT_PY_FILES)}")
     for rel, content in ENVIRONMENT_PY_FILES.items():
-        await sandbox_write_file(sandbox, f"/environment/{rel}", content)
+        await sandbox_write_file(sandbox, f"/environment/{rel}", content, ensure_dir=False)
 
     print(f"[setup] uploading env c files: {len(ENVIRONMENT_C_FILES)}")
     for rel, content in ENVIRONMENT_C_FILES.items():
-        await sandbox_write_file(sandbox, f"/environment/{rel}", content)
+        await sandbox_write_file(sandbox, f"/environment/{rel}", content, ensure_dir=False)
 
     print(f"[setup] uploading env txt files: {len(ENVIRONMENT_TXT_FILES)}")
     for rel, content in ENVIRONMENT_TXT_FILES.items():
-        await sandbox_write_file(sandbox, f"/environment/{rel}", content)
+        await sandbox_write_file(sandbox, f"/environment/{rel}", content, ensure_dir=False)
 
     print("[setup] running setup.sh")
     exit_code, stdout, stderr = await sandbox_run(sandbox, "bash /tmp/upload/setup.sh", timeout=600)
