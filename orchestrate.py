@@ -1,12 +1,12 @@
 """
 Main orchestrator for envoi-trace.
 
-Drives OpenCode turn-by-turn and saves a full `agent_trace.json` artifact
-containing all newly observed messages (including child sessions), per-turn
+Drives OpenCode with a step budget and saves a full `agent_trace.json` artifact
+containing all newly observed messages (including child sessions), per-step
 git checkpoints, and parsed envoi test calls.
 
 Usage:
-    modal run orchestrate.py --max-turns 5 --model opencode/claude-sonnet-4-6
+    modal run orchestrate.py --max-steps 1000 --model opencode/gpt-5-nano
 """
 
 from __future__ import annotations
@@ -29,8 +29,16 @@ from pydantic import BaseModel, Field
 
 app = modal.App("envoi-trace")
 
-DEFAULT_MODEL = "opencode/claude-sonnet-4"
-TURN_TIMEOUT_SECONDS = 600  # 10 min per turn (agent writes files + builds + tests)
+DEFAULT_MODEL = "opencode/gpt-5-nano"
+MESSAGE_TIMEOUT_SECONDS = int(
+    os.environ.get("MESSAGE_TIMEOUT_SECONDS", "600")
+)  # hard cap per message cycle
+MIN_CYCLE_TIMEOUT_SECONDS = int(
+    os.environ.get("MIN_CYCLE_TIMEOUT_SECONDS", "45")
+)  # don't go lower than this for healthy round-trips
+SECONDS_PER_REMAINING_STEP = int(
+    os.environ.get("SECONDS_PER_REMAINING_STEP", "60")
+)  # adaptive cap as step budget gets tight
 
 
 # ---------------------------------------------------------------------------
@@ -149,8 +157,9 @@ class EnvoiCall(BaseModel):
 
 
 class SessionEnd(BaseModel):
-    reason: Literal["solved", "turn_limit", "timeout", "agent_error", "envoi_error"]
-    total_turns: int
+    reason: Literal["solved", "step_limit", "timeout", "agent_error", "envoi_error"]
+    total_steps: int
+    total_turns: int | None = None  # backward compatibility for older consumers
     final_git_commit: str | None = None
 
 
@@ -162,9 +171,10 @@ class RepoCheckpoint(BaseModel):
     patch_s3_uri: str | None = None
 
 
-class TurnRecord(BaseModel):
+class StepRecord(BaseModel):
     trajectory_id: str
     session_id: str
+    step: int | None = None
     turn: int | None
     timestamp: str
     agent_model: str
@@ -184,9 +194,14 @@ class AgentTrace(BaseModel):
     session_id: str
     agent_model: str
     started_at: str
-    turns: list[TurnRecord] = Field(default_factory=list)
+    steps: list[StepRecord] = Field(default_factory=list)
+    turns: list[StepRecord] = Field(default_factory=list)
     artifacts: dict[str, str | None] = Field(default_factory=dict)
     session_end: SessionEnd | None = None
+
+
+# Backward compatibility alias for references using the old name.
+TurnRecord = StepRecord
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +326,19 @@ def extract_envoi_calls(message_parts: list[dict[str, Any]]) -> list[EnvoiCall]:
     return calls
 
 
+def count_step_finishes(messages: list[dict[str, Any]]) -> int:
+    """Count completed agent steps from message parts."""
+    count = 0
+    for message in messages:
+        parts = message.get("parts", [])
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if isinstance(part, dict) and part.get("type") == "step-finish":
+                count += 1
+    return count
+
+
 # ---------------------------------------------------------------------------
 # S3 helpers
 # ---------------------------------------------------------------------------
@@ -341,7 +369,8 @@ def save_agent_trace_snapshot(trajectory_id: str, trace: AgentTrace) -> None:
     payload = trace.model_dump(mode="json")
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     s3.put_object(Bucket=bucket, Key=key, Body=body)
-    print(f"[s3] saved agent trace ({len(trace.turns)} turns) to s3://{bucket}/{key}")
+    record_count = max(len(trace.steps), len(trace.turns))
+    print(f"[s3] saved agent trace ({record_count} records) to s3://{bucket}/{key}")
 
 
 def upload_file(trajectory_id: str, filename: str, data: bytes) -> str:
@@ -489,7 +518,7 @@ async def send_message_blocking(
     sandbox: modal.Sandbox,
     session_id: str,
     text: str,
-    timeout: int = TURN_TIMEOUT_SECONDS,
+    timeout: int = MESSAGE_TIMEOUT_SECONDS,
 ) -> dict[str, Any] | None:
     prompt_path = "/tmp/prompt.txt"
     await sandbox_write_file(sandbox, prompt_path, text, ensure_dir=False)
@@ -622,7 +651,7 @@ def message_id(message: dict[str, Any]) -> str | None:
     return None
 
 
-async def collect_turn_messages(
+async def collect_step_messages(
     sandbox: modal.Sandbox,
     root_session_id: str,
     seen_message_ids: set[str],
@@ -695,10 +724,10 @@ async def get_changed_files(sandbox: modal.Sandbox) -> list[str]:
     return files
 
 
-async def create_turn_checkpoint(
+async def create_step_checkpoint(
     sandbox: modal.Sandbox,
     trajectory_id: str,
-    turn: int,
+    step: int,
 ) -> RepoCheckpoint:
     commit_before = await get_git_commit(sandbox)
     changed_files = await get_changed_files(sandbox)
@@ -711,7 +740,7 @@ async def create_turn_checkpoint(
             patch_s3_uri=None,
         )
 
-    commit_message = f"turn {turn} checkpoint"
+    commit_message = f"step {step} checkpoint"
     exit_code, _, stderr = await sandbox_run(
         sandbox,
         "cd /workspace && git add -A && "
@@ -719,7 +748,7 @@ async def create_turn_checkpoint(
         quiet=True,
     )
     if exit_code != 0:
-        print(f"[git] checkpoint commit failed on turn {turn}: {truncate_text(stderr, limit=400)}")
+        print(f"[git] checkpoint commit failed on step {step}: {truncate_text(stderr, limit=400)}")
         return RepoCheckpoint(
             commit_before=commit_before,
             commit_after=commit_before,
@@ -739,11 +768,11 @@ async def create_turn_checkpoint(
         if patch_text.strip():
             patch_s3_uri = upload_file(
                 trajectory_id,
-                f"turns/{turn:04d}.patch",
+                f"steps/{step:04d}.patch",
                 patch_text.encode("utf-8"),
             )
 
-    print(f"[git] committed turn {turn}: {commit_after} files={len(changed_files)}")
+    print(f"[git] committed step {step}: {commit_after} files={len(changed_files)}")
     return RepoCheckpoint(
         commit_before=commit_before,
         commit_after=commit_after,
@@ -839,10 +868,10 @@ async def setup_sandbox(sandbox: modal.Sandbox, model: str, api_key: str) -> Non
 async def end_session(
     sandbox: modal.Sandbox,
     agent_trace: AgentTrace,
-    turn_count: int,
-    reason: Literal["solved", "turn_limit", "timeout", "agent_error", "envoi_error"],
+    step_count: int,
+    reason: Literal["solved", "step_limit", "timeout", "agent_error", "envoi_error"],
 ) -> None:
-    print(f"[end] reason={reason} turns={turn_count}")
+    print(f"[end] reason={reason} steps={step_count}")
 
     final_commit = await get_git_commit(sandbox)
     trace_s3_uri = artifact_uri(agent_trace.trajectory_id, "agent_trace.json")
@@ -850,7 +879,8 @@ async def end_session(
 
     agent_trace.session_end = SessionEnd(
         reason=reason,
-        total_turns=turn_count,
+        total_steps=step_count,
+        total_turns=step_count,
         final_git_commit=final_commit,
     )
     save_agent_trace_snapshot(agent_trace.trajectory_id, agent_trace)
@@ -878,7 +908,7 @@ async def end_session(
     except Exception as e:
         print(f"[bundle] failed: {e}")
 
-    turn_patch_prefix = artifact_uri(agent_trace.trajectory_id, "turns/")
+    step_patch_prefix = artifact_uri(agent_trace.trajectory_id, "steps/")
     manifest = {
         "trajectory_id": agent_trace.trajectory_id,
         "session_id": agent_trace.session_id,
@@ -890,7 +920,8 @@ async def end_session(
         "artifacts": {
             "agent_trace": trace_s3_uri,
             "repo_bundle": bundle_s3_uri,
-            "turn_patch_prefix": turn_patch_prefix,
+            "step_patch_prefix": step_patch_prefix,
+            "turn_patch_prefix": step_patch_prefix,
         },
     }
     manifest_data = json.dumps(manifest, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -899,13 +930,14 @@ async def end_session(
     agent_trace.artifacts = {
         "agent_trace": trace_s3_uri,
         "repo_bundle": bundle_s3_uri,
-        "turn_patch_prefix": turn_patch_prefix,
+        "step_patch_prefix": step_patch_prefix,
+        "turn_patch_prefix": step_patch_prefix,
         "artifacts_manifest": manifest_s3_uri,
     }
     save_agent_trace_snapshot(agent_trace.trajectory_id, agent_trace)
     print(f"[s3] saved artifacts manifest to {manifest_s3_uri}")
 
-    print(f"[end] session ended: {reason}, {turn_count} turns, commit={final_commit}")
+    print(f"[end] session ended: {reason}, {step_count} steps, commit={final_commit}")
 
 
 # ---------------------------------------------------------------------------
@@ -920,16 +952,19 @@ async def end_session(
 )
 async def run_trajectory(
     model: str = DEFAULT_MODEL,
-    max_turns: int = 1000,
+    max_steps: int = 1000,
+    max_turns: int | None = None,  # deprecated; kept for backward compatibility
     timeout_seconds: int = 14400,
     trajectory_id: str | None = None,
 ) -> str:
     if trajectory_id is None:
         trajectory_id = str(uuid.uuid4())
 
+    effective_max_steps = max_turns if max_turns is not None else max_steps
+
     resolved_model = resolve_model(model)
     print(f"Starting trajectory {trajectory_id}")
-    print(f"model={resolved_model} max_turns={max_turns} timeout={timeout_seconds}s")
+    print(f"model={resolved_model} max_steps={effective_max_steps} timeout={timeout_seconds}s")
 
     opencode_api_key = os.environ.get("OPENCODE_API_KEY", "")
     if not opencode_api_key:
@@ -963,56 +998,60 @@ async def run_trajectory(
         )
         save_agent_trace_snapshot(trajectory_id, agent_trace)
 
-        # --- Main loop: blocking message per turn ---
+        # --- Main loop: blocking message cycles with step budget ---
         tracker = SolveTracker()
         last_message_id: str | None = None
         seen_message_ids: set[str] = set()
-        turn_count = 0
+        cycle_count = 0
+        step_count = 0
         prompt_text = PROMPT
         end_reason: str | None = None
 
         try:
-            while turn_count < max_turns:
+            while step_count < effective_max_steps:
                 elapsed = time.monotonic() - start_time
                 if elapsed > timeout_seconds:
                     end_reason = "timeout"
                     break
 
                 print(f"\n{'=' * 60}")
-                print(f"TURN {turn_count + 1} / {max_turns}  (elapsed {int(elapsed)}s)")
+                print(
+                    f"CYCLE {cycle_count + 1}  "
+                    f"(steps {step_count}/{effective_max_steps}, elapsed {int(elapsed)}s)"
+                )
                 print(f"{'=' * 60}")
 
-                turn_started_at = datetime.now(UTC).isoformat()
+                cycle_started_at = datetime.now(UTC).isoformat()
 
                 # Send message and BLOCK until agent finishes
                 response = await send_message_blocking(
                     sandbox,
                     session_id,
                     prompt_text,
-                    timeout=TURN_TIMEOUT_SECONDS,
+                    timeout=MESSAGE_TIMEOUT_SECONDS,
                 )
 
                 if response is None:
-                    print("[turn] no response from agent")
+                    print("[cycle] no response from agent")
                     end_reason = "agent_error"
                     break
 
-                turn_count += 1
+                cycle_count += 1
 
                 # Log what the agent did
                 info = response.get("info", {})
                 parts = response.get("parts", [])
                 last_message_id = info.get("id")
-                print(f"[turn] response id={last_message_id} parts={len(parts)}")
+                print(f"[cycle] response id={last_message_id} parts={len(parts)}")
                 log_message_parts(response)
 
-                session_objects, session_ids, new_messages = await collect_turn_messages(
+                session_objects, session_ids, new_messages = await collect_step_messages(
                     sandbox,
                     session_id,
                     seen_message_ids,
                 )
                 print(
-                    f"[turn] new_messages={len(new_messages)} "
+                    f"[cycle] new_messages={len(new_messages)} "
                     f"sessions={len(session_ids)}"
                 )
 
@@ -1025,17 +1064,24 @@ async def run_trajectory(
 
                 tracker.update(new_envoi_calls)
 
-                checkpoint = await create_turn_checkpoint(
+                checkpoint = await create_step_checkpoint(
                     sandbox=sandbox,
                     trajectory_id=trajectory_id,
-                    turn=turn_count,
+                    step=cycle_count,
                 )
                 git_commit = checkpoint.commit_after or checkpoint.commit_before
+
+                new_steps = count_step_finishes(new_messages)
+                if new_steps == 0:
+                    # Fallback for providers that do not emit explicit step markers.
+                    new_steps = 1
+                step_count += new_steps
 
                 record = TurnRecord(
                     trajectory_id=trajectory_id,
                     session_id=session_id,
-                    turn=turn_count,
+                    step=cycle_count,
+                    turn=cycle_count,
                     timestamp=datetime.now(UTC).isoformat(),
                     agent_model=resolved_model,
                     prompt=prompt_text,
@@ -1047,23 +1093,29 @@ async def run_trajectory(
                     envoi_calls=new_envoi_calls,
                     repo_checkpoint=checkpoint,
                 )
+                agent_trace.steps.append(record)
                 agent_trace.turns.append(record)
                 save_agent_trace_snapshot(trajectory_id, agent_trace)
 
                 solved_count = len(tracker.solved)
                 total_count = len(REQUIRED_PATHS)
                 print(
-                    f"[turn] turn={turn_count} commit={git_commit} "
+                    f"[cycle] cycle={cycle_count} commit={git_commit} "
+                    f"steps=+{new_steps} total={step_count}/{effective_max_steps} "
                     f"envoi_calls={len(new_envoi_calls)} "
                     f"solved={solved_count}/{total_count} "
-                    f"started={turn_started_at}"
+                    f"started={cycle_started_at}"
                 )
 
                 if tracker.is_fully_solved():
                     end_reason = "solved"
                     break
 
-                # Build re-injection prompt for next turn
+                if step_count >= effective_max_steps:
+                    end_reason = "step_limit"
+                    break
+
+                # Build re-injection prompt for next cycle
                 unsolved = tracker.get_unsolved_paths()
                 details: list[str] = []
                 for p in unsolved[:10]:
@@ -1078,14 +1130,14 @@ async def run_trajectory(
                     prompt_text += "\n\nCurrent test status:\n" + "\n".join(details)
 
             if end_reason is None:
-                end_reason = "turn_limit"
+                end_reason = "step_limit"
 
         except Exception as loop_err:
             print(f"[error] crash during main loop: {loop_err}")
             end_reason = "agent_error"
             # Save whatever messages we have
             try:
-                session_objects, session_ids, crash_new_messages = await collect_turn_messages(
+                session_objects, session_ids, crash_new_messages = await collect_step_messages(
                     sandbox,
                     session_id,
                     seen_message_ids,
@@ -1094,7 +1146,8 @@ async def run_trajectory(
                     crash_record = TurnRecord(
                         trajectory_id=trajectory_id,
                         session_id=session_id,
-                        turn=turn_count + 1,
+                        step=cycle_count + 1,
+                        turn=cycle_count + 1,
                         timestamp=datetime.now(UTC).isoformat(),
                         agent_model=resolved_model,
                         prompt=prompt_text,
@@ -1105,6 +1158,7 @@ async def run_trajectory(
                         new_messages=crash_new_messages,
                         envoi_calls=[],
                     )
+                    agent_trace.steps.append(crash_record)
                     agent_trace.turns.append(crash_record)
                     save_agent_trace_snapshot(trajectory_id, agent_trace)
                     print(f"[error] saved {len(crash_new_messages)} new messages before crash")
@@ -1115,7 +1169,7 @@ async def run_trajectory(
         await end_session(
             sandbox,
             agent_trace,
-            turn_count,
+            step_count,
             end_reason,
         )
         return trajectory_id
@@ -1140,11 +1194,13 @@ async def run_trajectory(
 @app.local_entrypoint()
 async def main(
     model: str = DEFAULT_MODEL,
-    max_turns: int = 1000,
+    max_steps: int = 1000,
+    max_turns: int | None = None,
     trajectory_id: str | None = None,
 ) -> None:
     result = await run_trajectory.remote.aio(
         model=model,
+        max_steps=max_steps,
         max_turns=max_turns,
         trajectory_id=trajectory_id,
     )

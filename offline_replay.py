@@ -5,7 +5,7 @@ Given:
 - agent_trace.json (local path or s3:// URI)
 - repo.bundle (local path or s3:// URI)
 
-This script reconstructs repository state per turn, evaluates the compiler
+This script reconstructs repository state per step, evaluates the compiler
 for each unique commit, and writes a machine-readable JSON report.
 """
 
@@ -85,8 +85,8 @@ def load_agent_trace(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text())
     if not isinstance(data, dict):
         raise ValueError("agent_trace.json must contain a JSON object")
-    if not isinstance(data.get("turns"), list):
-        raise ValueError("agent_trace.json missing 'turns' list")
+    if not isinstance(data.get("steps"), list) and not isinstance(data.get("turns"), list):
+        raise ValueError("agent_trace.json missing both 'steps' and 'turns' lists")
     return data
 
 
@@ -190,12 +190,12 @@ def has_required_test_fixtures(test_paths: list[str]) -> tuple[bool, list[str]]:
     return len(missing) == 0, missing
 
 
-def parse_commit_from_turn(turn: dict[str, Any]) -> str | None:
+def parse_commit_from_step(step: dict[str, Any]) -> str | None:
     for key in ("git_commit",):
-        value = turn.get(key)
+        value = step.get(key)
         if isinstance(value, str) and value:
             return value
-    repo_checkpoint = turn.get("repo_checkpoint")
+    repo_checkpoint = step.get("repo_checkpoint")
     if isinstance(repo_checkpoint, dict):
         for key in ("commit_after", "commit_before"):
             value = repo_checkpoint.get(key)
@@ -204,21 +204,33 @@ def parse_commit_from_turn(turn: dict[str, Any]) -> str | None:
     return None
 
 
-def extract_turn_rows(trace: dict[str, Any]) -> list[dict[str, Any]]:
-    turns_raw = [
-        t
-        for t in trace.get("turns", [])
-        if isinstance(t, dict) and t.get("turn") is not None
+def get_step_records(trace: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_steps = trace.get("steps")
+    if isinstance(raw_steps, list):
+        return [step for step in raw_steps if isinstance(step, dict)]
+    raw_turns = trace.get("turns")
+    if isinstance(raw_turns, list):
+        return [step for step in raw_turns if isinstance(step, dict)]
+    return []
+
+
+def extract_step_rows(trace: dict[str, Any]) -> list[dict[str, Any]]:
+    steps_raw = [
+        step
+        for step in get_step_records(trace)
+        if step.get("step") is not None or step.get("turn") is not None
     ]
-    turns_raw.sort(key=lambda t: int(t.get("turn", 0)))
+    steps_raw.sort(key=lambda step: int(step.get("step") or step.get("turn") or 0))
 
     rows: list[dict[str, Any]] = []
-    for turn in turns_raw:
+    for step in steps_raw:
+        step_number = int(step.get("step") or step.get("turn") or 0)
         rows.append(
             {
-                "turn": int(turn["turn"]),
-                "commit": parse_commit_from_turn(turn),
-                "timestamp": turn.get("timestamp"),
+                "step": step_number,
+                "turn": step_number,  # backward compatibility for old consumers
+                "commit": parse_commit_from_step(step),
+                "timestamp": step.get("timestamp"),
             }
         )
     return rows
@@ -233,15 +245,15 @@ def get_unique_commits(rows: list[dict[str, Any]]) -> list[str]:
     return commit_order
 
 
-def resolve_turn_commit(trace: dict[str, Any], turn_number: int) -> tuple[str, dict[str, Any]]:
-    for row in extract_turn_rows(trace):
-        if row["turn"] != turn_number:
+def resolve_step_commit(trace: dict[str, Any], step_number: int) -> tuple[str, dict[str, Any]]:
+    for row in extract_step_rows(trace):
+        if row["step"] != step_number:
             continue
         commit = row.get("commit")
         if not isinstance(commit, str) or not commit:
-            raise ValueError(f"Turn {turn_number} has no commit recorded")
+            raise ValueError(f"Step {step_number} has no commit recorded")
         return commit, row
-    raise ValueError(f"Turn {turn_number} not found in trace")
+    raise ValueError(f"Step {step_number} not found in trace")
 
 
 async def evaluate_commit(
@@ -310,22 +322,23 @@ async def evaluate_commit(
     }
 
 
-def reconstruct_repo_at_turn(
+def reconstruct_repo_at_step(
     *,
     trace_path: Path,
     bundle_path: Path,
-    turn: int,
+    step: int,
     destination: Path,
 ) -> dict[str, Any]:
     trace = load_agent_trace(trace_path)
-    commit, row = resolve_turn_commit(trace, turn)
+    commit, row = resolve_step_commit(trace, step)
     destination.parent.mkdir(parents=True, exist_ok=True)
     clone_bundle(bundle_path, destination)
     checkout_commit(destination, commit)
     return {
         "trajectory_id": trace.get("trajectory_id"),
         "session_id": trace.get("session_id"),
-        "turn": turn,
+        "step": step,
+        "turn": step,
         "timestamp": row.get("timestamp"),
         "commit": commit,
         "repo_path": str(destination),
@@ -341,11 +354,11 @@ async def replay_trace(
     test_paths: list[str],
 ) -> dict[str, Any]:
     trace = load_agent_trace(trace_path)
-    turns = extract_turn_rows(trace)
-    commit_order = get_unique_commits(turns)
+    steps = extract_step_rows(trace)
+    commit_order = get_unique_commits(steps)
 
     if not commit_order:
-        raise ValueError("No commits found in trace turns")
+        raise ValueError("No commits found in trace steps")
 
     fixtures_ok, missing_fixtures = has_required_test_fixtures(test_paths)
     if not fixtures_ok:
@@ -373,16 +386,17 @@ async def replay_trace(
         stop_runtime(runtime)
         shutil.rmtree(workspace_root, ignore_errors=True)
 
-    turn_evals: list[dict[str, Any]] = []
-    for turn in turns:
-        commit = turn["commit"]
-        turn_result = {
-            "turn": turn["turn"],
-            "timestamp": turn["timestamp"],
+    step_evals: list[dict[str, Any]] = []
+    for step in steps:
+        commit = step["commit"]
+        step_result = {
+            "step": step["step"],
+            "turn": step["step"],
+            "timestamp": step["timestamp"],
             "commit": commit,
             "evaluation": commit_evals.get(commit),
         }
-        turn_evals.append(turn_result)
+        step_evals.append(step_result)
 
     report = {
         "trajectory_id": trace.get("trajectory_id"),
@@ -396,8 +410,10 @@ async def replay_trace(
         },
         "commits_evaluated": commit_order,
         "commit_evaluations": commit_evals,
-        "turn_to_commit": {str(t["turn"]): t.get("commit") for t in turns},
-        "turn_evaluations": turn_evals,
+        "step_to_commit": {str(s["step"]): s.get("commit") for s in steps},
+        "step_evaluations": step_evals,
+        "turn_to_commit": {str(s["step"]): s.get("commit") for s in steps},
+        "turn_evaluations": step_evals,
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -407,15 +423,16 @@ async def replay_trace(
 
 async def async_main() -> None:
     parser = argparse.ArgumentParser(
-        description="Replay trajectory artifacts, evaluate tests, or reconstruct repo at turn t.",
+        description="Replay trajectory artifacts, evaluate tests, or reconstruct repo at step t.",
     )
     parser.add_argument(
         "--mode",
-        choices=["evaluate", "checkout-turn"],
+        choices=["evaluate", "checkout-step", "checkout-turn"],
         default="evaluate",
         help=(
             "evaluate: run tests for all unique commits; "
-            "checkout-turn: materialize repo at a specific turn."
+            "checkout-step: materialize repo at a specific step. "
+            "checkout-turn is a deprecated alias."
         ),
     )
     parser.add_argument(
@@ -443,18 +460,20 @@ async def async_main() -> None:
         default="output/offline_eval.json",
         help=(
             "Where to write JSON output. For --mode evaluate this is the evaluation report; "
-            "for --mode checkout-turn this is checkout metadata."
+            "for --mode checkout-step this is checkout metadata."
         ),
     )
     parser.add_argument(
+        "--step",
         "--turn",
+        dest="step",
         type=int,
-        help="Turn number (required for --mode checkout-turn)",
+        help="Step number (required for --mode checkout-step; --turn is deprecated alias)",
     )
     parser.add_argument(
         "--checkout-dest",
         default=None,
-        help="Destination directory for --mode checkout-turn (default: output/repo_turn_<turn>)",
+        help="Destination directory for --mode checkout-step (default: output/repo_step_<step>)",
     )
     parser.add_argument(
         "--environment-file",
@@ -489,25 +508,25 @@ async def async_main() -> None:
 
         output_path = Path(args.output).expanduser().resolve()
 
-        if args.mode == "checkout-turn":
-            if args.turn is None:
-                parser.error("--turn is required when --mode checkout-turn")
+        if args.mode in {"checkout-step", "checkout-turn"}:
+            if args.step is None:
+                parser.error("--step is required when --mode checkout-step")
 
             checkout_dest = (
                 Path(args.checkout_dest).expanduser().resolve()
                 if args.checkout_dest
-                else Path(f"output/repo_turn_{args.turn}").expanduser().resolve()
+                else Path(f"output/repo_step_{args.step}").expanduser().resolve()
             )
-            metadata = reconstruct_repo_at_turn(
+            metadata = reconstruct_repo_at_step(
                 trace_path=trace_path,
                 bundle_path=bundle_path,
-                turn=args.turn,
+                step=args.step,
                 destination=checkout_dest,
             )
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(json.dumps(metadata, indent=2))
             print(
-                f"[done] checked out turn {args.turn} at commit {metadata['commit']} "
+                f"[done] checked out step {args.step} at commit {metadata['commit']} "
                 f"to {checkout_dest}"
             )
             print(f"[done] wrote checkout metadata to {output_path}")
@@ -529,7 +548,7 @@ async def async_main() -> None:
         shutil.rmtree(scratch, ignore_errors=True)
 
     print(
-        f"[done] wrote {len(report['turn_evaluations'])} turn evaluations "
+        f"[done] wrote {len(report['step_evaluations'])} step evaluations "
         f"to {Path(args.output).expanduser().resolve()}"
     )
 
