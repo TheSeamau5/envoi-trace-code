@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import builtins
 import json
 import os
 import time
@@ -27,6 +28,19 @@ from pydantic import BaseModel, Field
 app = modal.App("envoi-trace")
 
 DEFAULT_MODEL = "opencode/claude-sonnet-4"
+
+
+def ts() -> str:
+    return datetime.now(UTC).strftime("%H:%M:%S")
+
+
+def tprint(*args: Any, **kwargs: Any) -> None:
+    if "flush" not in kwargs:
+        kwargs["flush"] = True
+    builtins.print(f"[{ts()}]", *args, **kwargs)
+
+
+print = tprint
 
 PROMPT = (Path(__file__).parent / "prompts" / "system.txt").read_text()
 SETUP_SH = (Path(__file__).parent / "sandbox" / "setup.sh").read_text()
@@ -314,7 +328,8 @@ sandbox_image = (
 
 async def sandbox_run(sandbox: modal.Sandbox, cmd: str, timeout: int = 60) -> tuple[int, str, str]:
     """Execute a command inside the sandbox and return (exit_code, stdout, stderr)."""
-    print(f"[sandbox_run] cmd={cmd[:200]}")
+    start = time.monotonic()
+    print(f"[sandbox_run] start cmd={cmd[:200]}")
     proc = await sandbox.exec.aio("bash", "-c", cmd)
     stdout = ""
     stderr = ""
@@ -324,6 +339,11 @@ async def sandbox_run(sandbox: modal.Sandbox, cmd: str, timeout: int = 60) -> tu
         stderr += chunk
     await proc.wait.aio()
     exit_code = proc.returncode or 0
+    duration = time.monotonic() - start
+    print(
+        f"[sandbox_run] done exit={exit_code} duration={duration:.2f}s "
+        f"stdout_len={len(stdout)} stderr_len={len(stderr)}"
+    )
     if exit_code != 0:
         print(f"[sandbox_run] exit_code={exit_code}")
         if stderr:
@@ -376,6 +396,73 @@ def summarize_messages(messages: list[dict[str, Any]]) -> dict[str, Any]:
         "tail_roles": tail_roles,
         "tail_ids": tail_ids,
     }
+
+
+def summarize_tool_input(name: str, input_data: Any) -> str:
+    if not isinstance(input_data, dict):
+        return truncate_text(str(input_data), limit=200)
+    if name == "bash":
+        return truncate_text(input_data.get("command", ""), limit=200)
+    if name in {"write", "edit"}:
+        path = input_data.get("filePath") or input_data.get("path") or "?"
+        content = input_data.get("content") or input_data.get("newString") or ""
+        return f"{path} ({len(content)} bytes)"
+    if name == "run_tests":
+        return input_data.get("test_path", truncate_text(json.dumps(input_data), limit=200))
+    return truncate_text(json.dumps(input_data), limit=200)
+
+
+def log_message_parts(message: dict[str, Any]) -> None:
+    info = message.get("info", {})
+    role = info.get("role", "unknown")
+    msg_id = info.get("id", "unknown")
+    provider = info.get("providerID") or info.get("model", {}).get("providerID")
+    model_id = info.get("modelID") or info.get("model", {}).get("modelID")
+    parts = message.get("parts", [])
+    print(f"[msg] role={role} id={msg_id} provider={provider} model={model_id} parts={len(parts)}")
+    if not parts:
+        print("[msg] no parts")
+        return
+    for idx, part in enumerate(parts):
+        ptype = part.get("type", "unknown")
+        if ptype == "text":
+            text = part.get("text", "")
+            print(f"[msg] part[{idx}] text: {truncate_text(text, limit=500)}")
+        elif ptype == "tool_use":
+            name = part.get("name", "?")
+            status = part.get("status", "")
+            tool_id = part.get("id", "")
+            summary = summarize_tool_input(name, part.get("input", {}))
+            print(f"[msg] part[{idx}] tool_use: {name} status={status} id={tool_id} {summary}")
+        elif ptype == "tool_result":
+            status = part.get("status", "")
+            tool_use_id = part.get("tool_use_id", "")
+            content = part.get("content", "")
+            print(
+                f"[msg] part[{idx}] tool_result: status={status} tool_use_id={tool_use_id} "
+                f"{truncate_text(str(content), limit=500)}"
+            )
+        else:
+            print(f"[msg] part[{idx}] {ptype}: {truncate_text(json.dumps(part), limit=500)}")
+
+
+def find_messages_after(
+    messages: list[dict[str, Any]],
+    last_message_id: str | None,
+) -> list[dict[str, Any]]:
+    if last_message_id is None:
+        return messages
+    seen = False
+    new_msgs: list[dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("info", {}).get("id") == last_message_id:
+            seen = True
+            continue
+        if seen:
+            new_msgs.append(msg)
+    if not seen:
+        return messages
+    return new_msgs
 
 
 async def debug_endpoint_json(
@@ -471,6 +558,97 @@ async def get_messages(sandbox: modal.Sandbox, session_id: str) -> list[dict[str
     except json.JSONDecodeError:
         print("[get_messages] failed to parse JSON")
         return []
+
+
+async def get_session_status(sandbox: modal.Sandbox, session_id: str) -> str:
+    exit_code, stdout, stderr = await sandbox_run(
+        sandbox,
+        "curl -sS -w '\nHTTP_STATUS:%{http_code}' http://localhost:4096/session/status",
+        timeout=10,
+    )
+    body, status = parse_http_status(stdout)
+    if exit_code != 0 or (status is not None and status >= 400):
+        print(f"[session_status] fetch failed exit={exit_code} status={status}")
+        if stderr:
+            print(f"[session_status] stderr:\n{stderr}")
+        return "unknown"
+    try:
+        data = json.loads(body) if body.strip() else {}
+    except json.JSONDecodeError:
+        print("[session_status] failed to parse JSON")
+        return "unknown"
+    state = data.get(session_id, {}).get("type", "idle")
+    print(f"[session_status] {session_id} -> {state}")
+    return state
+
+
+async def wait_for_agent_idle(
+    sandbox: modal.Sandbox,
+    session_id: str,
+    last_message_id: str | None,
+    poll_interval: int = 3,
+    per_turn_timeout: int = 180,
+) -> tuple[list[dict[str, Any]], str | None, str, bool]:
+    start = time.monotonic()
+    poll_count = 0
+    new_messages: list[dict[str, Any]] = []
+    current_last_id = last_message_id
+    status = "unknown"
+    last_status = None
+    timed_out = False
+
+    print(
+        f"[wait] starting wait_for_agent_idle poll_interval={poll_interval}s "
+        f"per_turn_timeout={per_turn_timeout}s last_message_id={last_message_id}"
+    )
+
+    while True:
+        await asyncio.sleep(poll_interval)
+        poll_count += 1
+
+        status = await get_session_status(sandbox, session_id)
+        if status != last_status:
+            print(f"[wait] status change {last_status} -> {status}")
+            last_status = status
+
+        if not await is_opencode_healthy(sandbox):
+            print("[wait] OpenCode unhealthy during wait")
+            break
+
+        messages = await get_messages(sandbox, session_id)
+        fresh = find_messages_after(messages, current_last_id)
+        if fresh:
+            print(f"[wait] new_messages={len(fresh)} total_messages={len(messages)}")
+            for msg in fresh:
+                log_message_parts(msg)
+            new_messages.extend(fresh)
+            current_last_id = fresh[-1].get("info", {}).get("id", current_last_id)
+        else:
+            print(f"[wait] no new messages (total={len(messages)})")
+
+        elapsed = time.monotonic() - start
+        print(f"[wait] poll={poll_count} elapsed={elapsed:.1f}s status={status}")
+
+        if poll_count % 10 == 0:
+            await tail_sandbox_logs(sandbox)
+
+        if status != "busy":
+            break
+        if elapsed > per_turn_timeout:
+            print(f"[wait] per-turn timeout after {per_turn_timeout}s")
+            timed_out = True
+            break
+
+    messages = await get_messages(sandbox, session_id)
+    fresh = find_messages_after(messages, current_last_id)
+    if fresh:
+        print(f"[wait] final new_messages={len(fresh)}")
+        for msg in fresh:
+            log_message_parts(msg)
+        new_messages.extend(fresh)
+        current_last_id = fresh[-1].get("info", {}).get("id", current_last_id)
+
+    return new_messages, current_last_id, status, timed_out
 
 
 async def send_user_message(
@@ -715,19 +893,17 @@ async def run_trajectory(
         tracker = SolveTracker()
         last_message_id: str | None = None
         turn_count = 0
-        consecutive_idle_turns = 0
-        MAX_IDLE_TURNS = 3
+        TURN_POLL_SECONDS = 3
+        TURN_TIMEOUT_SECONDS = 180
 
         while True:
-            await asyncio.sleep(5)
-
+            elapsed_total = time.monotonic() - start_time
             print(
-                f"[poll] elapsed={int(time.monotonic() - start_time)}s turn={turn_count} "
-                f"idle={consecutive_idle_turns} last_msg={last_message_id}"
+                f"[loop] start turn={turn_count} elapsed_total={int(elapsed_total)}s "
+                f"max_turns={max_turns}"
             )
 
-            elapsed = time.monotonic() - start_time
-            if elapsed > timeout_seconds:
+            if elapsed_total > timeout_seconds:
                 await end_session(
                     sandbox,
                     trajectory_id,
@@ -740,135 +916,103 @@ async def run_trajectory(
                 )
                 return trajectory_id
 
-            if not await is_opencode_healthy(sandbox):
+            new_messages, last_message_id, status, timed_out = await wait_for_agent_idle(
+                sandbox,
+                session_id,
+                last_message_id,
+                poll_interval=TURN_POLL_SECONDS,
+                per_turn_timeout=TURN_TIMEOUT_SECONDS,
+            )
+
+            if timed_out and status == "busy":
+                print("[loop] per-turn timeout while busy; ending session")
                 await end_session(
                     sandbox,
                     trajectory_id,
                     session_id,
                     turn_count,
-                    "agent_error",
+                    "timeout",
                     tracker,
                     last_message_id,
                     resolved_model,
                 )
                 return trajectory_id
 
-            messages = await get_messages(sandbox, session_id)
-            print(f"[poll] messages_received={len(messages)}")
-            new_turn = detect_new_turn(messages, last_message_id)
+            turn_count += 1
 
-            if (time.monotonic() - start_time) % 30 < 5:
-                await tail_sandbox_logs(sandbox)
-                await debug_endpoint_json(
-                    sandbox, "session_status", "http://localhost:4096/session/status", limit=2000
+            all_envoi_calls: list[EnvoiCall] = []
+            all_parts: list[dict[str, Any]] = []
+            for msg in new_messages:
+                parts = msg.get("parts", [])
+                all_parts.extend(parts)
+                all_envoi_calls.extend(extract_envoi_calls(parts))
+
+            if not new_messages:
+                print("[turn] no new messages collected this turn")
+
+            tracker.update(all_envoi_calls)
+
+            git_commit = await get_git_commit(sandbox)
+
+            record = TurnRecord(
+                trajectory_id=trajectory_id,
+                session_id=session_id,
+                turn=turn_count,
+                timestamp=datetime.now(UTC).isoformat(),
+                agent_model=resolved_model,
+                git_commit=git_commit,
+                message_id=last_message_id,
+                envoi_calls=all_envoi_calls,
+            )
+            append_jsonl_record(trajectory_id, record)
+
+            print(
+                f"[turn] completed turn={turn_count} messages={len(new_messages)} "
+                f"parts={len(all_parts)} envoi_calls={len(all_envoi_calls)} "
+                f"commit={git_commit} status={status}"
+            )
+
+            if tracker.is_fully_solved():
+                await end_session(
+                    sandbox,
+                    trajectory_id,
+                    session_id,
+                    turn_count,
+                    "solved",
+                    tracker,
+                    last_message_id,
+                    resolved_model,
                 )
+                return trajectory_id
 
-            if new_turn:
-                turn_count += 1
-                info = new_turn.get("info", {})
-                last_message_id = info.get("id")
-                parts = new_turn.get("parts", [])
-
-                print(
-                    f"[turn] new message id={last_message_id} parts={len(parts)} tools={has_tool_calls(parts)}"
+            if turn_count >= max_turns:
+                await end_session(
+                    sandbox,
+                    trajectory_id,
+                    session_id,
+                    turn_count,
+                    "turn_limit",
+                    tracker,
+                    last_message_id,
+                    resolved_model,
                 )
+                return trajectory_id
 
-                envoi_calls = extract_envoi_calls(parts)
-                tracker.update(envoi_calls)
-
-                git_commit = await get_git_commit(sandbox)
-
-                record = TurnRecord(
-                    trajectory_id=trajectory_id,
-                    session_id=session_id,
-                    turn=turn_count,
-                    timestamp=datetime.now(UTC).isoformat(),
-                    agent_model=resolved_model,
-                    git_commit=git_commit,
-                    message_id=last_message_id,
-                    envoi_calls=envoi_calls,
-                )
-                append_jsonl_record(trajectory_id, record)
-
-                print(f"Turn {turn_count}: {len(envoi_calls)} envoi calls, commit={git_commit}")
-
-                if tracker.is_fully_solved():
-                    await end_session(
-                        sandbox,
-                        trajectory_id,
-                        session_id,
-                        turn_count,
-                        "solved",
-                        tracker,
-                        last_message_id,
-                        resolved_model,
-                    )
-                    return trajectory_id
-
-                if turn_count >= max_turns:
-                    await end_session(
-                        sandbox,
-                        trajectory_id,
-                        session_id,
-                        turn_count,
-                        "turn_limit",
-                        tracker,
-                        last_message_id,
-                        resolved_model,
-                    )
-                    return trajectory_id
-
-                if has_tool_calls(parts):
-                    consecutive_idle_turns = 0
+            failed_paths = tracker.get_unsolved_paths()
+            details: list[str] = []
+            for p in failed_paths[:5]:
+                call = tracker.get_latest_call_for_path(p)
+                if call and call.result:
+                    details.append(f"  - {p}: {call.result.passed}/{call.result.total}")
                 else:
-                    consecutive_idle_turns += 1
+                    details.append(f"  - {p}: not run")
 
-                if turn_count >= 5 and consecutive_idle_turns >= MAX_IDLE_TURNS:
-                    git_has_changes = await check_git_has_changes(sandbox)
-                    if not git_has_changes:
-                        print("Agent appears done. Running all tests...")
-                        all_results = await run_all_tests(sandbox, session_id)
+            reinject_msg = "Continue working on the compiler. Run tests and pass ALL suites."
+            if details:
+                reinject_msg += "\n\nCurrent test status:\n" + "\n".join(details)
 
-                        if all_results["all_passed"]:
-                            tracker.update(all_results["calls"])
-                            if tracker.is_fully_solved():
-                                await end_session(
-                                    sandbox,
-                                    trajectory_id,
-                                    session_id,
-                                    turn_count,
-                                    "solved",
-                                    tracker,
-                                    last_message_id,
-                                    resolved_model,
-                                )
-                                return trajectory_id
-
-                        failed_paths = tracker.get_unsolved_paths()
-                        if failed_paths:
-                            details = []
-                            for p in failed_paths[:5]:
-                                call = tracker.get_latest_call_for_path(p)
-                                if call and call.result:
-                                    details.append(
-                                        f"  - {p}: {call.result.passed}/{call.result.total}"
-                                    )
-                                else:
-                                    details.append(f"  - {p}: not run")
-
-                            reinject_msg = (
-                                "Some tests are still failing.\n\n"
-                                "Failed test suites:\n"
-                                + "\n".join(details)
-                                + "\n\nPlease continue working and pass ALL tests."
-                            )
-                            await send_user_message(
-                                sandbox, session_id, reinject_msg, resolved_model
-                            )
-                            consecutive_idle_turns = 0
-                            print(f"Re-injected with {len(failed_paths)} failed paths")
-            else:
-                print("[poll] no new assistant turn yet")
+            print("[turn] sending continue prompt")
+            await send_user_message(sandbox, session_id, reinject_msg, resolved_model)
 
     except Exception as e:
         print(f"Error: {e}")
@@ -1012,13 +1156,30 @@ async def end_session(
     append_jsonl_record(trajectory_id, end_record)
 
     try:
-        await sandbox_run(
+        exit_code, _, stderr = await sandbox_run(
             sandbox, "cd /workspace && git bundle create /tmp/repo.bundle --all", timeout=60
         )
-        _, bundle_b64, _ = await sandbox_run(sandbox, "base64 /tmp/repo.bundle", timeout=60)
-        bundle_data = base64.b64decode(bundle_b64.strip())
-        upload_file(trajectory_id, "repo.bundle", bundle_data)
-        print("Uploaded git bundle to S3")
+        print(f"[bundle] git bundle exit={exit_code}")
+        if stderr:
+            print(f"[bundle] stderr:\n{stderr}")
+
+        _, size_out, _ = await sandbox_run(
+            sandbox, "stat -c %s /tmp/repo.bundle 2>/dev/null || echo 0", timeout=10
+        )
+        try:
+            bundle_size = int(size_out.strip() or "0")
+        except ValueError:
+            bundle_size = 0
+        print(f"[bundle] size={bundle_size} bytes")
+
+        if bundle_size > 0:
+            _, bundle_b64, _ = await sandbox_run(sandbox, "base64 /tmp/repo.bundle", timeout=60)
+            bundle_data = base64.b64decode(bundle_b64.strip())
+            print(f"[bundle] decoded size={len(bundle_data)} bytes")
+            upload_file(trajectory_id, "repo.bundle", bundle_data)
+            print("[bundle] uploaded git bundle to S3")
+        else:
+            print("[bundle] WARNING: bundle is 0 bytes, skipping upload")
     except Exception as e:
         print(f"Failed to upload git bundle: {e}")
 
