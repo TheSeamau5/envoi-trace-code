@@ -64,6 +64,7 @@ if [ ! -d /opt/tests/c-testsuite/tests/single-exec ] || \
     echo "[fixtures] syncing c-testsuite..."
     rm -rf /opt/tests/c-testsuite
     git clone --depth 1 https://github.com/c-testsuite/c-testsuite.git /opt/tests/c-testsuite
+    echo "[fixtures] done: c-testsuite synced"
 else
     echo "[fixtures] c-testsuite already present"
 fi
@@ -72,6 +73,7 @@ if [ ! -d /opt/tests/wacct/tests ] || [ ! -f /opt/tests/wacct/expected_results.j
     echo "[fixtures] syncing writing-a-c-compiler-tests..."
     rm -rf /opt/tests/wacct
     git clone --depth 1 https://github.com/nlsandler/writing-a-c-compiler-tests.git /opt/tests/wacct
+    echo "[fixtures] done: writing-a-c-compiler-tests synced"
 else
     echo "[fixtures] wacct already present"
 fi
@@ -87,9 +89,12 @@ if [ ! -d "$TORTURE_EXEC_DIR" ] || ! ls "$TORTURE_EXEC_DIR"/*.c >/dev/null 2>&1;
     git config core.sparseCheckout true
     echo "SingleSource/Regression/C/gcc-c-torture/execute/" > .git/info/sparse-checkout
     git pull --depth 1 origin main
+    echo "[fixtures] done: llvm-test-suite torture execute shard synced"
 else
     echo "[fixtures] torture execute shard already present"
 fi
+
+echo "[fixtures] all task fixtures ready"
 """
 
 

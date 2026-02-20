@@ -706,6 +706,7 @@ async def sandbox_run(
     timeout: int = 60,
     quiet: bool = False,
     stream_output: bool = False,
+    on_stdout_line: Callable[[str], Awaitable[None]] | None = None,
     on_stderr_line: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[int, str, str]:
     """Execute a command inside the sandbox."""
@@ -736,7 +737,11 @@ async def sandbox_run(
             await line_callback(line_buffer.rstrip("\r"))
 
     await asyncio.gather(
-        drain_stream(proc.stdout, stdout_chunks),
+        drain_stream(
+            proc.stdout,
+            stdout_chunks,
+            line_callback=on_stdout_line,
+        ),
         drain_stream(
             proc.stderr,
             stderr_chunks,
@@ -763,7 +768,10 @@ async def sandbox_write_file(
     path: str,
     content: str,
     ensure_dir: bool = True,
+    log_upload: bool = False,
 ) -> None:
+    if log_upload:
+        print(f"[setup][upload] {path}")
     if ensure_dir:
         await sandbox_run(sandbox, f"mkdir -p '{Path(path).parent}'", quiet=True)
     async with await sandbox.open.aio(path, "w") as f:
@@ -1215,11 +1223,29 @@ async def upload_environment_files(sandbox: modal.Sandbox) -> None:
         await sandbox_run(sandbox, f"mkdir -p {' '.join(repr(d) for d in env_dirs)}", quiet=True)
 
     for rel, content in ENVIRONMENT_PY_FILES.items():
-        await sandbox_write_file(sandbox, f"/environment/{rel}", content, ensure_dir=False)
+        await sandbox_write_file(
+            sandbox,
+            f"/environment/{rel}",
+            content,
+            ensure_dir=False,
+            log_upload=True,
+        )
     for rel, content in ENVIRONMENT_C_FILES.items():
-        await sandbox_write_file(sandbox, f"/environment/{rel}", content, ensure_dir=False)
+        await sandbox_write_file(
+            sandbox,
+            f"/environment/{rel}",
+            content,
+            ensure_dir=False,
+            log_upload=True,
+        )
     for rel, content in ENVIRONMENT_TXT_FILES.items():
-        await sandbox_write_file(sandbox, f"/environment/{rel}", content, ensure_dir=False)
+        await sandbox_write_file(
+            sandbox,
+            f"/environment/{rel}",
+            content,
+            ensure_dir=False,
+            log_upload=True,
+        )
 
     print(
         f"[setup] uploaded {len(ENVIRONMENT_PY_FILES)} py, "
@@ -1229,10 +1255,23 @@ async def upload_environment_files(sandbox: modal.Sandbox) -> None:
 
 async def run_setup_script(sandbox: modal.Sandbox, agent: str) -> None:
     print(f"[setup] running setup.sh (agent={agent})...")
+
+    async def handle_setup_line(line: str) -> None:
+        stripped = line.strip()
+        if not stripped:
+            return
+        if stripped.startswith("[setup]") or stripped.startswith("[fixtures]"):
+            print(stripped)
+            return
+        if stripped.startswith("ERROR:"):
+            print(f"[setup] {stripped}")
+
     exit_code, stdout, stderr = await sandbox_run(
         sandbox,
         f"AGENT_KIND={shlex.quote(agent)} bash /tmp/upload/setup.sh",
         timeout=1800,
+        on_stdout_line=handle_setup_line,
+        on_stderr_line=handle_setup_line,
     )
     if exit_code != 0:
         print(f"[setup] FAILED:\n{stdout}\n{stderr}")
@@ -1242,15 +1281,40 @@ async def run_setup_script(sandbox: modal.Sandbox, agent: str) -> None:
 
 async def setup_sandbox_opencode(sandbox: modal.Sandbox, model: str, api_key: str) -> None:
     print(f"[setup] agent=opencode model={model}")
-    await sandbox_write_file(sandbox, "/tmp/upload/setup.sh", SETUP_SH)
-    await sandbox_write_file(sandbox, "/tmp/upload/task_setup.sh", TASK_SANDBOX_SETUP_SH)
-    await sandbox_write_file(sandbox, "/sandbox/mcp_server.py", MCP_SERVER)
-    await sandbox_write_file(sandbox, "/sandbox/opencode_client.py", OPENCODE_CLIENT)
-    await sandbox_write_file(sandbox, "/tmp/upload/opencode_api_key.txt", api_key)
+    await sandbox_write_file(sandbox, "/tmp/upload/setup.sh", SETUP_SH, log_upload=True)
+    await sandbox_write_file(
+        sandbox,
+        "/tmp/upload/task_setup.sh",
+        TASK_SANDBOX_SETUP_SH,
+        log_upload=True,
+    )
+    await sandbox_write_file(sandbox, "/sandbox/mcp_server.py", MCP_SERVER, log_upload=True)
+    await sandbox_write_file(
+        sandbox,
+        "/sandbox/opencode_client.py",
+        OPENCODE_CLIENT,
+        log_upload=True,
+    )
+    await sandbox_write_file(
+        sandbox,
+        "/tmp/upload/opencode_api_key.txt",
+        api_key,
+        log_upload=True,
+    )
 
     config = OPENCODE_CONFIG.replace("MODEL_PLACEHOLDER", model)
-    await sandbox_write_file(sandbox, "/workspace/opencode.jsonc", config)
-    await sandbox_write_file(sandbox, "/workspace/.gitignore", WORKSPACE_GITIGNORE)
+    await sandbox_write_file(
+        sandbox,
+        "/workspace/opencode.jsonc",
+        config,
+        log_upload=True,
+    )
+    await sandbox_write_file(
+        sandbox,
+        "/workspace/.gitignore",
+        WORKSPACE_GITIGNORE,
+        log_upload=True,
+    )
     await upload_environment_files(sandbox)
     await run_setup_script(sandbox, "opencode")
 
@@ -1262,18 +1326,48 @@ async def setup_sandbox_codex(
     auth_json: str | None = None,
 ) -> None:
     print(f"[setup] agent=codex model={model}")
-    await sandbox_write_file(sandbox, "/tmp/upload/setup.sh", SETUP_SH)
-    await sandbox_write_file(sandbox, "/tmp/upload/task_setup.sh", TASK_SANDBOX_SETUP_SH)
-    await sandbox_write_file(sandbox, "/sandbox/mcp_server.py", MCP_SERVER)
-    await sandbox_write_file(sandbox, "/sandbox/codex_client.py", CODEX_CLIENT)
+    await sandbox_write_file(sandbox, "/tmp/upload/setup.sh", SETUP_SH, log_upload=True)
+    await sandbox_write_file(
+        sandbox,
+        "/tmp/upload/task_setup.sh",
+        TASK_SANDBOX_SETUP_SH,
+        log_upload=True,
+    )
+    await sandbox_write_file(sandbox, "/sandbox/mcp_server.py", MCP_SERVER, log_upload=True)
+    await sandbox_write_file(
+        sandbox,
+        "/sandbox/codex_client.py",
+        CODEX_CLIENT,
+        log_upload=True,
+    )
     if api_key:
-        await sandbox_write_file(sandbox, "/tmp/upload/codex_api_key.txt", api_key)
+        await sandbox_write_file(
+            sandbox,
+            "/tmp/upload/codex_api_key.txt",
+            api_key,
+            log_upload=True,
+        )
 
     codex_config = CODEX_CONFIG_TOML.replace("MODEL_PLACEHOLDER", model)
-    await sandbox_write_file(sandbox, f"{CODEX_HOME_DIR}/config.toml", codex_config)
+    await sandbox_write_file(
+        sandbox,
+        f"{CODEX_HOME_DIR}/config.toml",
+        codex_config,
+        log_upload=True,
+    )
     if auth_json:
-        await sandbox_write_file(sandbox, f"{CODEX_HOME_DIR}/auth.json", auth_json)
-    await sandbox_write_file(sandbox, "/workspace/.gitignore", WORKSPACE_GITIGNORE)
+        await sandbox_write_file(
+            sandbox,
+            f"{CODEX_HOME_DIR}/auth.json",
+            auth_json,
+            log_upload=True,
+        )
+    await sandbox_write_file(
+        sandbox,
+        "/workspace/.gitignore",
+        WORKSPACE_GITIGNORE,
+        log_upload=True,
+    )
     await upload_environment_files(sandbox)
     await run_setup_script(sandbox, "codex")
 
@@ -1760,17 +1854,23 @@ async def _run_trajectory_impl(
                 "CODEX_AUTH_JSON_B64/CODEX_AUTH_JSON, or CODEX_API_KEY/OPENAI_API_KEY."
             )
 
-    sandbox = await modal.Sandbox.create.aio(
-        "bash",
-        "-c",
-        "sleep infinity",
-        image=sandbox_image,
-        timeout=timeout_seconds,
-        app=app,
-    )
-    start_time = time.monotonic()
+    sandbox: modal.Sandbox | None = None
+    agent_trace: AgentTrace | None = None
+    turn_count = 0
+    part_count = 0
+    end_reason: str | None = None
 
     try:
+        sandbox = await modal.Sandbox.create.aio(
+            "bash",
+            "-c",
+            "sleep infinity",
+            image=sandbox_image,
+            timeout=timeout_seconds,
+            app=app,
+        )
+        start_time = time.monotonic()
+
         # --- Setup ---
         await backend.setup_sandbox(sandbox, resolved_model, agent_api_key, codex_auth_json)
 
@@ -1792,10 +1892,7 @@ async def _run_trajectory_impl(
         # --- Main loop: blocking message calls with part budget ---
         tracker = SolveTracker(list(TASK_REQUIRED_TEST_PATHS))
         seen_message_ids: set[str] = set()
-        turn_count = 0
-        part_count = 0
         prompt_text = TASK_SYSTEM_PROMPT
-        end_reason: str | None = None
 
         try:
             while part_count < effective_max_parts:
@@ -2060,12 +2157,24 @@ async def _run_trajectory_impl(
 
     except Exception as e:
         print(f"[error] {e}")
-        raise
+        if sandbox is not None and agent_trace is not None:
+            try:
+                await end_session(
+                    sandbox,
+                    agent_trace,
+                    part_count,
+                    turn_count,
+                    "agent_error",
+                )
+            except Exception as end_err:
+                print(f"[error] failed to finalize session after exception: {end_err}")
+        return trajectory_id
     finally:
-        try:
-            await sandbox.terminate.aio()
-        except Exception:
-            pass
+        if sandbox is not None:
+            try:
+                await sandbox.terminate.aio()
+            except Exception:
+                pass
 
     return trajectory_id
 
@@ -2136,12 +2245,18 @@ async def main(
             print(f"[auth] no codex auth file found at {Path(codex_auth_file).expanduser()}")
 
     runner = get_non_preemptible_runner() if non_preemptible else run_trajectory
-    result = await runner.remote.aio(
-        agent=normalized_agent,
-        model=model,
-        max_parts=max_parts,
-        message_timeout_seconds=message_timeout_seconds,
-        trajectory_id=trajectory_id,
-        codex_auth_json_b64=codex_auth_json_b64,
-    )
-    print(f"Completed trajectory: {result}")
+    try:
+        result = await runner.remote.aio(
+            agent=normalized_agent,
+            model=model,
+            max_parts=max_parts,
+            message_timeout_seconds=message_timeout_seconds,
+            trajectory_id=trajectory_id,
+            codex_auth_json_b64=codex_auth_json_b64,
+        )
+        print(f"Completed trajectory: {result}")
+    except Exception as e:
+        message = str(e).strip()
+        if not message:
+            message = "remote run stopped or failed"
+        print(f"[error] {message}")
