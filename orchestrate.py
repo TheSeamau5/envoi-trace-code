@@ -485,6 +485,22 @@ sandbox_image = (
 # ---------------------------------------------------------------------------
 
 
+async def dump_sandbox_logs(sandbox: modal.Sandbox, tail: int = 50) -> None:
+    """Print the tail of OpenCode and envoi logs from the sandbox."""
+    for log_file in ["/tmp/opencode.log", "/tmp/envoi.log"]:
+        try:
+            _, stdout, _ = await sandbox_run(
+                sandbox, f"tail -n {tail} {log_file}", timeout=10, quiet=True
+            )
+            if stdout.strip():
+                label = log_file.split("/")[-1]
+                print(f"[logs] === {label} (last {tail} lines) ===")
+                for line in stdout.strip().splitlines():
+                    builtins.print(f"  {line}", flush=True)
+        except Exception:
+            pass
+
+
 async def sandbox_run(
     sandbox: modal.Sandbox,
     cmd: str,
@@ -505,10 +521,25 @@ async def sandbox_run(
             if live and chunk:
                 builtins.print(chunk, end="", flush=True)
 
-    await asyncio.gather(
-        drain_stream(proc.stdout, stdout_chunks),
-        drain_stream(proc.stderr, stderr_chunks, live=stream_output),
-    )
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(
+                drain_stream(proc.stdout, stdout_chunks),
+                drain_stream(proc.stderr, stderr_chunks, live=stream_output),
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        print(f"[run] TIMEOUT after {timeout}s, killing: {cmd[:100]}")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        await proc.wait.aio()
+        stdout = "".join(stdout_chunks)
+        stderr = "".join(stderr_chunks)
+        return 124, stdout, stderr  # 124 = timeout convention
+
     await proc.wait.aio()
     stdout = "".join(stdout_chunks)
     stderr = "".join(stderr_chunks)
@@ -1137,6 +1168,7 @@ async def run_trajectory(
 
                 if response is None:
                     print("[turn] no response from agent")
+                    await dump_sandbox_logs(sandbox)
                     end_reason = "agent_error"
                     break
 
@@ -1278,6 +1310,7 @@ async def run_trajectory(
 
         except Exception as loop_err:
             print(f"[error] crash during main loop: {loop_err}")
+            await dump_sandbox_logs(sandbox)
             end_reason = "agent_error"
             # Save whatever messages we have
             try:
