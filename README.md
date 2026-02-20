@@ -82,5 +82,5 @@ uv run python offline_replay.py --help
 ## Dev Check
 
 ```bash
-uv run ruff check orchestrate.py sandbox/opencode_client.py sandbox/codex_client.py offline_replay.py run_trace.py graph_trace.py
+uv run ruff check orchestrate.py sandbox/opencode_client.py sandbox/codex_client.py offline_replay.py scripts/trace.py scripts/graph_trace.py
 ```

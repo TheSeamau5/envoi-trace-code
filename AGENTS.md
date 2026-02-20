@@ -173,7 +173,7 @@ Behavior:
 - Tool exposure: `sandbox/opencode.jsonc` and `sandbox/mcp_server.py`.
 - Test suite behavior: `environment/tests/*.py`.
 - Offline reconstruction/reporting: `offline_replay.py`.
-- Short launchers: `run_trace.py`, `graph_trace.py`.
+- Short launchers: `scripts/trace.py`, `scripts/graph_trace.py`.
 
 ## Operational Notes
 - Use `uv` for local Python workflows.

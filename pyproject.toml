@@ -24,8 +24,8 @@ dev = [
 ]
 
 [project.scripts]
-graph_trace = "graph_trace:main"
-trace = "run_trace:main"
+graph_trace = "scripts.graph_trace:main"
+trace = "scripts.trace:main"
 
 [build-system]
 requires = ["hatchling"]
