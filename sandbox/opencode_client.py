@@ -174,6 +174,26 @@ def event_session_id(event: dict[str, Any]) -> str | None:
     return None
 
 
+def _tool_detail(tool: str, state: Any) -> str:
+    """Extract a short detail string from tool input."""
+    if not isinstance(state, dict):
+        return ""
+    inp = state.get("input", {})
+    if not isinstance(inp, dict):
+        return ""
+    if tool == "bash":
+        cmd = inp.get("command", "")
+        return cmd[:80] if cmd else ""
+    if tool == "read":
+        return str(inp.get("filePath") or inp.get("path") or "")
+    if tool in ("write", "edit"):
+        path = inp.get("filePath") or inp.get("path") or ""
+        return str(path)
+    if tool == "run_tests":
+        return inp.get("test_path", "")
+    return ""
+
+
 def summarize_event(event: dict[str, Any]) -> str | None:
     """Return a short human-readable summary, or None to suppress."""
     event_type = event.get("type")
@@ -199,6 +219,9 @@ def summarize_event(event: dict[str, Any]) -> str | None:
             # Only show completed (skip pending/running noise)
             if status != "completed":
                 return None
+            detail = _tool_detail(tool, state)
+            if detail:
+                return f"[tool] {tool}: {detail}"
             return f"[tool] {tool}"
         if part_type == "patch":
             files = part.get("files")
