@@ -1009,28 +1009,11 @@ async def end_session(
         print(f"[bundle] failed: {e}")
 
     part_patch_prefix = artifact_uri(agent_trace.trajectory_id, "parts/")
-    manifest = {
-        "trajectory_id": agent_trace.trajectory_id,
-        "session_id": agent_trace.session_id,
-        "agent_model": agent_trace.agent_model,
-        "ended_at": datetime.now(UTC).isoformat(),
-        "session_end": (
-            agent_trace.session_end.model_dump(mode="json") if agent_trace.session_end else None
-        ),
-        "artifacts": {
-            "agent_trace": trace_s3_uri,
-            "repo_bundle": bundle_s3_uri,
-            "part_patch_prefix": part_patch_prefix,
-        },
-    }
-    manifest_data = json.dumps(manifest, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    manifest_s3_uri = upload_file(agent_trace.trajectory_id, "artifacts.json", manifest_data)
 
     agent_trace.artifacts = {
         "agent_trace": trace_s3_uri,
         "repo_bundle": bundle_s3_uri,
         "part_patch_prefix": part_patch_prefix,
-        "artifacts_manifest": manifest_s3_uri,
     }
     save_agent_trace_snapshot(agent_trace.trajectory_id, agent_trace)
     print(f"[s3] saved artifacts manifest to {manifest_s3_uri}")
