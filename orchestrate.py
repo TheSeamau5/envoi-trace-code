@@ -973,6 +973,10 @@ async def end_session(
 ) -> None:
     print(f"[end] reason={reason} parts={part_count} turns={turn_count}")
 
+    if part_count == 0 and turn_count == 0:
+        print("[end] nothing to save (0 parts, 0 turns), skipping S3 upload")
+        return
+
     final_commit = await get_git_commit(sandbox)
     trace_s3_uri = artifact_uri(agent_trace.trajectory_id, "agent_trace.json")
     bundle_s3_uri: str | None = None
