@@ -1113,13 +1113,14 @@ async def run_trajectory(
                     message_timeout_seconds=message_timeout_seconds,
                 )
 
-                print(f"\n{'=' * 60}")
+                banner = "=" * 60
+                print(f"\n{banner}")
                 print(
-                    f"TURN {turn_count + 1}  "
+                    f" TURN {turn_count + 1}  "
                     f"(part_count {part_count}/{effective_max_parts}, "
-                    f"timeout {turn_timeout_seconds}s, elapsed {int(elapsed)}s)"
+                    f"timeout {turn_timeout_seconds}s)"
                 )
-                print(f"{'=' * 60}")
+                print(banner)
 
                 turn_started_at = datetime.now(UTC).isoformat()
 
