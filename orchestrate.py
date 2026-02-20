@@ -572,8 +572,7 @@ def save_agent_trace_snapshot(
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     s3.put_object(Bucket=bucket, Key=key, Body=body)
     print(
-        f"[s3] saved agent trace (turns={turn_count} parts={part_count}) "
-        f"to s3://{bucket}/{key}"
+        f"[s3] saved agent trace (parts={part_count}) to s3://{bucket}/{key}"
     )
 
 
@@ -1398,10 +1397,10 @@ async def end_session(
     turn_count: int,
     reason: Literal["solved", "part_limit", "timeout", "agent_error", "envoi_error"],
 ) -> None:
-    print(f"[end] reason={reason} parts={part_count} turns={turn_count}")
+    print(f"[end] reason={reason} parts={part_count}")
 
     if part_count == 0 and turn_count == 0:
-        print("[end] nothing to save (0 parts, 0 turns), skipping S3 upload")
+        print("[end] nothing to save (0 parts), skipping S3 upload")
         return
 
     final_commit = await get_git_commit(sandbox)
@@ -1449,8 +1448,7 @@ async def end_session(
     save_agent_trace_snapshot(agent_trace.trajectory_id, agent_trace)
 
     print(
-        f"[end] session ended: {reason}, {part_count} parts, "
-        f"{turn_count} turns, commit={final_commit}"
+        f"[end] session ended: {reason}, {part_count} parts, commit={final_commit}"
     )
 
 
@@ -1677,21 +1675,35 @@ async def _run_trajectory_impl(
                     agent=agent,
                     turn=turn_count,
                     part_start=(previous_part_count + 1) if new_parts > 0 else None,
-                    part_end=part_count if new_parts > 0 else None,
+                    part_end=None,
                     timestamp=datetime.now(UTC).isoformat(),
                     agent_model=resolved_model,
                     prompt=prompt_text,
-                    git_commit=git_commit,
-                    message_id=last_message_id,
-                    sessions=session_objects,
-                    session_ids=session_ids,
-                    new_messages=new_messages,
-                    envoi_calls=new_envoi_calls,
-                    repo_checkpoint=checkpoint,
-                    parts=part_records_for_turn,
+                    git_commit=git_commit if new_parts == 0 else None,
+                    message_id=last_message_id if new_parts == 0 else None,
+                    sessions=session_objects if new_parts == 0 else [],
+                    session_ids=session_ids if new_parts == 0 else [],
+                    new_messages=new_messages if new_parts == 0 else [],
+                    envoi_calls=new_envoi_calls if new_parts == 0 else [],
+                    repo_checkpoint=checkpoint if new_parts == 0 else None,
+                    parts=[],
                 )
                 agent_trace.turns.append(turn_record)
-                save_agent_trace_snapshot(trajectory_id, agent_trace)
+                if part_records_for_turn:
+                    for part_record in part_records_for_turn:
+                        turn_record.parts.append(part_record)
+                        turn_record.part_end = part_record.part
+                        if part_record.message_id is not None:
+                            turn_record.git_commit = part_record.git_commit
+                            turn_record.message_id = part_record.message_id
+                            turn_record.sessions = part_record.sessions
+                            turn_record.session_ids = part_record.session_ids
+                            turn_record.new_messages = part_record.new_messages
+                            turn_record.envoi_calls = part_record.envoi_calls
+                            turn_record.repo_checkpoint = part_record.repo_checkpoint
+                        save_agent_trace_snapshot(trajectory_id, agent_trace)
+                else:
+                    save_agent_trace_snapshot(trajectory_id, agent_trace)
 
                 solved_count = len(tracker.solved)
                 total_count = len(REQUIRED_PATHS)
