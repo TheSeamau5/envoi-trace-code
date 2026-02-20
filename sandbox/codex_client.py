@@ -83,6 +83,88 @@ def mcp_output_payload(result: Any, error: Any) -> str:
     return ""
 
 
+def parse_json_maybe(value: Any) -> Any:
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return value
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def format_generic_structured(value: Any) -> str:
+    parsed = parse_json_maybe(value)
+    if isinstance(parsed, (dict, list)):
+        return json.dumps(parsed, indent=2, ensure_ascii=False)
+    return str(parsed)
+
+
+def format_run_tests_output(value: Any) -> str:
+    parsed = parse_json_maybe(value)
+    if isinstance(parsed, dict) and "result" in parsed:
+        parsed = parse_json_maybe(parsed.get("result"))
+
+    if not isinstance(parsed, dict):
+        return format_generic_structured(parsed)
+
+    lines: list[str] = []
+    path = parsed.get("path")
+    status_code = parsed.get("status_code")
+    duration_ms = parsed.get("duration_ms")
+    error = parsed.get("error")
+
+    if isinstance(path, str):
+        lines.append(f"path: {path}")
+    if isinstance(status_code, int):
+        lines.append(f"status_code: {status_code}")
+    if isinstance(duration_ms, (int, float)):
+        lines.append(f"duration_ms: {duration_ms}")
+    if error:
+        lines.append(f"error: {error}")
+
+    result_obj = parse_json_maybe(parsed.get("result"))
+    if isinstance(result_obj, dict):
+        passed = result_obj.get("passed")
+        failed = result_obj.get("failed")
+        total = result_obj.get("total")
+        if isinstance(passed, int) and isinstance(failed, int) and isinstance(total, int):
+            lines.append(f"summary: passed={passed} failed={failed} total={total}")
+
+        cases = result_obj.get("cases")
+        if isinstance(cases, list):
+            failed_cases = [
+                case
+                for case in cases
+                if isinstance(case, dict) and not bool(case.get("passed"))
+            ]
+            if failed_cases:
+                lines.append("failed_cases:")
+                for case in failed_cases:
+                    name = str(case.get("name") or "?")
+                    phase = str(case.get("phase") or "?")
+                    lines.append(f"  - {name} ({phase})")
+                    stderr_value = case.get("stderr")
+                    if isinstance(stderr_value, str) and stderr_value.strip():
+                        lines.append(f"    stderr: {stderr_value.strip()}")
+            elif isinstance(passed, int) and isinstance(total, int) and passed == total:
+                lines.append("failed_cases: []")
+
+    if not lines:
+        return format_generic_structured(parsed)
+    return "\n".join(lines)
+
+
+def format_mcp_output_for_log(tool_name: str, result: Any, error: Any) -> str:
+    if isinstance(error, dict) and error:
+        return format_generic_structured(error)
+    if tool_name == "run_tests":
+        return format_run_tests_output(result)
+    return format_generic_structured(mcp_output_payload(result, error))
+
+
 def part_from_item(item: dict[str, Any]) -> dict[str, Any] | None:
     item_type = item.get("type")
 
@@ -357,9 +439,14 @@ def summarize_event(event: dict[str, Any]) -> tuple[str, str | None] | None:
             if status:
                 details_lines.append(f"status={status}")
             if event_type == "item.completed":
-                output_preview = mcp_output_payload(item.get("result"), item.get("error"))
+                output_preview = format_mcp_output_for_log(
+                    tool_name,
+                    item.get("result"),
+                    item.get("error"),
+                )
                 if output_preview:
-                    details_lines.append(f"output={output_preview}")
+                    details_lines.append("output:")
+                    details_lines.append(output_preview)
             return (description, "\n".join(details_lines))
         if item_type == "agent_message":
             text = str(item.get("text") or "").strip()
