@@ -731,7 +731,7 @@ async def run_codex_client(
     quiet: bool = False,
     stream_output: bool = False,
 ) -> dict[str, Any] | None:
-    command = "python3 /sandbox/codex_client.py " + " ".join(shlex.quote(a) for a in args)
+    command = "python3 -u /sandbox/codex_client.py " + " ".join(shlex.quote(a) for a in args)
     exit_code, stdout, stderr = await sandbox_run(
         sandbox,
         command,
@@ -1535,11 +1535,16 @@ async def _run_trajectory_impl(
                     break
                 remaining_run_seconds = timeout_seconds - elapsed
                 remaining_parts = max(1, effective_max_parts - part_count)
-                turn_timeout_seconds = compute_turn_timeout_seconds(
-                    remaining_parts=remaining_parts,
-                    remaining_run_seconds=remaining_run_seconds,
-                    message_timeout_seconds=message_timeout_seconds,
-                )
+                if agent == "codex":
+                    # For Codex, don't short-circuit long productive turns with the
+                    # per-turn message timeout; only the overall run timeout applies.
+                    turn_timeout_seconds = max(1, int(remaining_run_seconds))
+                else:
+                    turn_timeout_seconds = compute_turn_timeout_seconds(
+                        remaining_parts=remaining_parts,
+                        remaining_run_seconds=remaining_run_seconds,
+                        message_timeout_seconds=message_timeout_seconds,
+                    )
 
                 banner = "=" * 60
                 builtins.print(f"\n{banner}", flush=True)

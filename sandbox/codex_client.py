@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -229,6 +230,56 @@ def start_stream_drain_thread(stream: Any, sink: list[str]) -> threading.Thread 
     return reader
 
 
+def progress_timestamp() -> str:
+    return time.strftime("%H:%M:%S", time.localtime())
+
+
+def clean_progress_content(value: Any, limit: int = 240) -> str:
+    text = str(value or "")
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit] + "..."
+
+
+def log_progress(
+    *,
+    parts_seen: int,
+    max_parts: int,
+    description: str,
+    content: str | None = None,
+) -> None:
+    total_label = str(max_parts) if max_parts > 0 else "?"
+    print(
+        f"[{progress_timestamp()}] [{parts_seen} / {total_label} parts] {description}",
+        file=sys.stderr,
+        flush=True,
+    )
+    if content:
+        print(clean_progress_content(content), file=sys.stderr, flush=True)
+    print("", file=sys.stderr, flush=True)
+
+
+def start_progress_heartbeat(
+    stats: dict[str, int | float],
+    stop_event: threading.Event,
+    *,
+    max_parts: int,
+    interval_sec: int = 15,
+) -> threading.Thread:
+    def _heartbeat() -> None:
+        while not stop_event.wait(interval_sec):
+            log_progress(
+                parts_seen=int(stats["meaningful_parts"]),
+                max_parts=max_parts,
+                description="heartbeat",
+            )
+
+    thread = threading.Thread(target=_heartbeat, daemon=True)
+    thread.start()
+    return thread
+
+
 def meaningful_part_from_event(event: dict[str, Any]) -> dict[str, Any] | None:
     if event.get("type") != "item.completed":
         return None
@@ -252,6 +303,74 @@ def parse_line_events_and_meaningful_count(line: str) -> tuple[list[dict[str, An
     return parsed_events, meaningful_parts
 
 
+def summarize_event(event: dict[str, Any]) -> tuple[str, str | None] | None:
+    event_type = event.get("type")
+    if not isinstance(event_type, str):
+        return None
+
+    if event_type == "thread.started":
+        thread_id = event.get("thread_id")
+        if isinstance(thread_id, str) and thread_id:
+            return (event_type, f"thread_id={thread_id}")
+        return (event_type, None)
+
+    if event_type in {"turn.started", "turn.completed", "turn.failed", "error"}:
+        err = event.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message")
+            if isinstance(msg, str) and msg:
+                return (event_type, msg)
+        msg = event.get("message")
+        if isinstance(msg, str) and msg:
+            return (event_type, msg)
+        return (event_type, None)
+
+    if event_type in {"item.started", "item.completed"}:
+        item = event.get("item")
+        if not isinstance(item, dict):
+            return (event_type, None)
+        item_type = item.get("type")
+        if not isinstance(item_type, str):
+            return (event_type, None)
+        description = f"{event_type} {item_type}"
+        if item_type == "command_execution":
+            command = str(item.get("command") or "").strip()
+            if command:
+                return (description, command)
+            return (description, None)
+        if item_type == "mcp_tool_call":
+            tool_name = str(item.get("tool") or "mcp_tool_call")
+            status = str(item.get("status") or "")
+            details = f"tool={tool_name}"
+            if status:
+                details += f" status={status}"
+            return (description, details)
+        if item_type == "agent_message":
+            text = str(item.get("text") or "").strip()
+            return (description, text if text else None)
+        return (description, None)
+
+    return None
+
+
+def log_event_stream_progress(
+    parsed_events: list[dict[str, Any]],
+    meaningful_parts_seen: int,
+    max_parts: int,
+) -> None:
+    for event in parsed_events:
+        summary = summarize_event(event)
+        if not summary:
+            continue
+        description, content = summary
+        log_progress(
+            parts_seen=meaningful_parts_seen,
+            max_parts=max_parts,
+            description=description,
+            content=content,
+        )
+
+
 def run_codex_turn(
     *,
     session_id: str | None,
@@ -262,6 +381,12 @@ def run_codex_turn(
 ) -> dict[str, Any]:
     command = build_codex_exec_command(session_id=session_id, model=model)
     env = build_codex_env(api_key)
+    log_progress(
+        parts_seen=0,
+        max_parts=max_parts,
+        description="launching codex exec",
+        content=" ".join(command),
+    )
 
     proc = subprocess.Popen(
         command,
@@ -282,6 +407,18 @@ def run_codex_turn(
     aborted_for_part_limit = False
     meaningful_parts_seen = 0
 
+    progress_stats: dict[str, int | float] = {
+        "started_at": time.monotonic(),
+        "events": 0,
+        "meaningful_parts": 0,
+    }
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = start_progress_heartbeat(
+        progress_stats,
+        heartbeat_stop,
+        max_parts=max_parts,
+    )
+
     stderr_reader = start_stream_drain_thread(proc.stderr, stderr_lines)
 
     if proc.stdout is not None:
@@ -290,9 +427,23 @@ def run_codex_turn(
             parsed_events, meaningful_from_line = parse_line_events_and_meaningful_count(line)
             if parsed_events:
                 events.extend(parsed_events)
+                progress_stats["events"] = len(events)
             meaningful_parts_seen += meaningful_from_line
+            progress_stats["meaningful_parts"] = meaningful_parts_seen
+            if parsed_events:
+                log_event_stream_progress(
+                    parsed_events,
+                    meaningful_parts_seen,
+                    max_parts=max_parts,
+                )
             if max_parts > 0 and meaningful_parts_seen >= max_parts:
                 aborted_for_part_limit = True
+                log_progress(
+                    parts_seen=meaningful_parts_seen,
+                    max_parts=max_parts,
+                    description="part limit reached",
+                    content="terminating codex process",
+                )
                 proc.terminate()
                 break
 
@@ -307,11 +458,24 @@ def run_codex_turn(
     except subprocess.TimeoutExpired:
         proc.kill()
         return_code = proc.wait()
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=1)
 
     if stderr_reader is not None:
         stderr_reader.join(timeout=2)
 
     stderr_text = "".join(stderr_lines)
+    elapsed = int(time.monotonic() - float(progress_stats["started_at"]))
+    log_progress(
+        parts_seen=meaningful_parts_seen,
+        max_parts=max_parts,
+        description="completed",
+        content=(
+            f"exit={return_code} elapsed={elapsed}s events={len(events)} "
+            f"aborted_for_part_limit={aborted_for_part_limit}"
+        ),
+    )
 
     if not events and stdout_lines:
         events = parse_jsonl_events("".join(stdout_lines))
