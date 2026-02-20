@@ -2204,20 +2204,35 @@ async def run_trajectory(
     )
 
 
-_RUN_TRAJECTORY_NON_PREEMPTIBLE: Any | None = None
+@app.function(
+    timeout=14400,
+    secrets=[modal.Secret.from_dotenv()],
+    image=function_image,
+    nonpreemptible=True,
+    name="run_trajectory_non_preemptible",
+)
+async def run_trajectory_non_preemptible(
+    agent: str = DEFAULT_AGENT,
+    model: str | None = None,
+    max_parts: int = 1000,
+    message_timeout_seconds: int = MESSAGE_TIMEOUT_SECONDS,
+    timeout_seconds: int = 14400,
+    trajectory_id: str | None = None,
+    codex_auth_json_b64: str | None = None,
+) -> str:
+    return await _run_trajectory_impl(
+        agent=agent,
+        model=model,
+        max_parts=max_parts,
+        message_timeout_seconds=message_timeout_seconds,
+        timeout_seconds=timeout_seconds,
+        trajectory_id=trajectory_id,
+        codex_auth_json_b64=codex_auth_json_b64,
+    )
 
 
 def get_non_preemptible_runner() -> Any:
-    global _RUN_TRAJECTORY_NON_PREEMPTIBLE
-    if _RUN_TRAJECTORY_NON_PREEMPTIBLE is None:
-        _RUN_TRAJECTORY_NON_PREEMPTIBLE = app.function(
-            timeout=14400,
-            secrets=[modal.Secret.from_dotenv()],
-            image=function_image,
-            nonpreemptible=True,
-            name="run_trajectory_non_preemptible",
-        )(_run_trajectory_impl)
-    return _RUN_TRAJECTORY_NON_PREEMPTIBLE
+    return run_trajectory_non_preemptible
 
 
 # ---------------------------------------------------------------------------
@@ -2231,7 +2246,7 @@ async def main(
     model: str | None = None,
     max_parts: int = 1000,
     message_timeout_seconds: int = MESSAGE_TIMEOUT_SECONDS,
-    non_preemptible: bool = False,
+    non_preemptible: bool = True,
     trajectory_id: str | None = None,
     codex_auth_file: str = "~/.codex/auth.json",
 ) -> None:

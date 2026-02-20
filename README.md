@@ -51,6 +51,7 @@ uv run trace
 Defaults:
 - agent: `codex`
 - max parts: `1000`
+- non-preemptible Modal execution: `enabled`
 
 The launcher prints these immediately at startup:
 - `TRAJECTORY_ID`
@@ -65,6 +66,7 @@ Useful options:
 uv run trace --detach
 uv run trace --max-parts 200
 uv run trace --agent opencode --model opencode/gpt-5-nano
+uv run trace --preemptible
 ```
 
 ## 4) Analyze A Trajectory

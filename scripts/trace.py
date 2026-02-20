@@ -48,11 +48,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Launch runner.py with short defaults.",
     )
+    parser.set_defaults(non_preemptible=True)
     parser.add_argument("--agent", choices=["codex", "opencode"], default="codex")
     parser.add_argument("--model", default=None)
     parser.add_argument("--max-parts", type=int, default=1000)
     parser.add_argument("--message-timeout-seconds", type=int, default=None)
-    parser.add_argument("--non-preemptible", action="store_true")
+    parser.add_argument(
+        "--non-preemptible",
+        dest="non_preemptible",
+        action="store_true",
+        help="Run with Modal non-preemptible execution (default).",
+    )
+    parser.add_argument(
+        "--preemptible",
+        dest="non_preemptible",
+        action="store_false",
+        help="Opt into preemptible execution.",
+    )
     parser.add_argument("--detach", action="store_true")
     parser.add_argument("--trajectory-id", default=None)
     parser.add_argument("--codex-auth-file", default="~/.codex/auth.json")
@@ -69,7 +81,9 @@ def main() -> None:
     print(f"TRACE_S3_URI: {trace_uri}", flush=True)
     print(f"BUNDLE_S3_URI: {bundle_uri}", flush=True)
     print(
-        f"agent={args.agent} max_parts={args.max_parts} detach={args.detach}",
+        "agent="
+        f"{args.agent} max_parts={args.max_parts} detach={args.detach} "
+        f"non_preemptible={args.non_preemptible}",
         flush=True,
     )
     print(banner, flush=True)

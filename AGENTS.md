@@ -183,6 +183,7 @@ Behavior:
 - Default run behavior:
   - agent: `codex`
   - max parts: `1000`
+  - non-preemptible Modal execution: enabled
 - Normal workflow:
   - run trajectory (`uv run trace`)
   - capture `TRAJECTORY_ID` from startup logs
@@ -194,6 +195,10 @@ Behavior:
 - With explicit options:
   ```bash
   uv run trace --agent codex --max-parts 100 --detach
+  ```
+- Optional opt-out for preemptible execution:
+  ```bash
+  uv run trace --preemptible
   ```
 - Direct Modal command (full control):
   ```bash

@@ -81,6 +81,7 @@ fi
 TORTURE_EXEC_DIR="/opt/tests/llvm-test-suite/SingleSource/Regression/C/gcc-c-torture/execute"
 if [ ! -d "$TORTURE_EXEC_DIR" ] || ! ls "$TORTURE_EXEC_DIR"/*.c >/dev/null 2>&1; then
     echo "[fixtures] syncing llvm-test-suite torture execute shard..."
+    echo "[fixtures] note: this sync is large and can take several minutes (often 3-10 min)"
     rm -rf /opt/tests/llvm-test-suite
     mkdir -p /opt/tests/llvm-test-suite
     cd /opt/tests/llvm-test-suite
