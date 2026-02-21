@@ -97,6 +97,36 @@ def parse_json_maybe(value: Any) -> Any:
     return value
 
 
+def parse_int_maybe(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+    return None
+
+
+def normalize_run_tests_payload(value: Any) -> dict[str, Any] | None:
+    parsed = parse_json_maybe(value)
+    if not isinstance(parsed, dict):
+        return None
+    if "path" in parsed and "timestamp" in parsed:
+        return parsed
+    for nested_key in ("result", "data", "output", "structured_content"):
+        if nested_key in parsed:
+            nested = normalize_run_tests_payload(parsed.get(nested_key))
+            if isinstance(nested, dict):
+                return nested
+    return None
+
+
 def truncate_for_trace(value: str, limit: int = 240) -> str:
     compact = " ".join(value.split())
     if len(compact) <= limit:
@@ -112,21 +142,21 @@ def extract_run_tests_call(item: dict[str, Any]) -> dict[str, Any] | None:
     payload: Any = result_obj.get("structured_content")
     if payload is None:
         payload = mcp_output_payload(item.get("result"), item.get("error"))
-    parsed = parse_json_maybe(payload)
+    parsed = normalize_run_tests_payload(payload)
     if not isinstance(parsed, dict):
         return None
 
     path = parsed.get("path")
     timestamp = parsed.get("timestamp")
-    duration_ms = parsed.get("duration_ms")
-    status_code = parsed.get("status_code")
+    duration_ms = parse_int_maybe(parsed.get("duration_ms"))
+    status_code = parse_int_maybe(parsed.get("status_code"))
     if not isinstance(path, str) or not path:
         return None
     if not isinstance(timestamp, str) or not timestamp:
         return None
-    if not isinstance(duration_ms, int):
+    if duration_ms is None:
         return None
-    if not isinstance(status_code, int):
+    if status_code is None:
         return None
 
     normalized: dict[str, Any] = {
@@ -494,6 +524,20 @@ def emit_trace_event(payload: dict[str, Any]) -> None:
     print(f"{TRACE_EVENT_PREFIX}{_json_dumps(payload)}", file=sys.stderr, flush=True)
 
 
+def event_token_usage(event: dict[str, Any], item: dict[str, Any]) -> dict[str, Any] | None:
+    for source in (
+        event.get("usage"),
+        event.get("token_usage"),
+        event.get("tokens"),
+        item.get("usage"),
+        item.get("token_usage"),
+        item.get("tokens"),
+    ):
+        if isinstance(source, dict) and source:
+            return source
+    return None
+
+
 def trace_event_from_event(event: dict[str, Any]) -> dict[str, Any] | None:
     if event.get("type") != "item.completed":
         return None
@@ -515,20 +559,50 @@ def trace_event_from_event(event: dict[str, Any]) -> dict[str, Any] | None:
         files = workspace_changed_files()
         has_file_change = bool(files)
     summary: str | None = None
+    content: str | None = None
+    tool_name: str | None = None
+    tool_status: str | None = None
+    tool_input: Any = None
+    tool_output: Any = None
+    tool_error: Any = None
+    tool_exit_code: int | None = None
     if part_type in {"reasoning", "text"}:
         text = str(part.get("text") or item.get("text") or "").strip()
+        content = text or None
         summary = truncate_for_trace(text) if text else None
     elif item_type == "command_execution":
         command = str(item.get("command") or "").strip()
+        tool_name = "bash"
+        tool_status = str(item.get("status") or "completed")
+        tool_input = {"command": command}
+        tool_output = item.get("aggregated_output", "")
+        tool_exit_code = parse_int_maybe(item.get("exit_code"))
         summary = truncate_for_trace(command) if command else None
     elif item_type == "mcp_tool_call":
         tool_name = str(item.get("tool") or "mcp_tool_call")
         args = item.get("arguments")
+        tool_status = str(item.get("status") or "completed")
+        tool_input = args if isinstance(args, dict) else {}
+        tool_output = mcp_output_payload(item.get("result"), item.get("error"))
+        tool_error = item.get("error")
         test_path = ""
         if isinstance(args, dict):
             test_path = str(args.get("test_path") or "")
         suffix = f" {test_path}" if test_path else ""
         summary = f"{tool_name}{suffix}".strip()
+    elif part_type == "tool":
+        tool_name = str(part.get("tool") or "")
+        state = part.get("state")
+        if isinstance(state, dict):
+            tool_status = (
+                str(state.get("status"))
+                if state.get("status") is not None
+                else None
+            )
+            tool_input = state.get("input")
+            tool_output = state.get("output")
+            tool_exit_code = parse_int_maybe(state.get("exit_code"))
+
     test_call = extract_run_tests_call(item) if item_type == "mcp_tool_call" else None
     return {
         "event": "part.completed",
@@ -536,8 +610,19 @@ def trace_event_from_event(event: dict[str, Any]) -> dict[str, Any] | None:
         "part_type": part_type,
         "item_type": item_type,
         "summary": summary,
+        "content": content,
         "has_file_change": has_file_change,
         "files": files,
+        "tool_name": tool_name,
+        "tool_status": tool_status,
+        "tool_input": tool_input,
+        "tool_output": tool_output,
+        "tool_error": tool_error,
+        "tool_exit_code": tool_exit_code,
+        "token_usage": event_token_usage(event, item),
+        "provider_part": part,
+        "provider_item": item,
+        "provider_event": event,
         "test_call": test_call,
         "timestamp_ms": int(time.time() * 1000),
     }
@@ -619,6 +704,51 @@ def log_event_stream_progress(
             content=content,
             truncate_content="mcp_tool_call" not in description,
         )
+
+
+def _collect_usage_candidates(value: Any, sink: list[dict[str, Any]]) -> None:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            lower_key = key.lower()
+            if isinstance(nested, dict) and ("token" in lower_key or "usage" in lower_key):
+                sink.append(nested)
+            _collect_usage_candidates(nested, sink)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_usage_candidates(item, sink)
+
+
+def _merge_usage(base: dict[str, Any], incoming: dict[str, Any]) -> None:
+    for key, value in incoming.items():
+        if key not in base:
+            base[key] = value
+            continue
+        existing = base[key]
+        if isinstance(existing, dict) and isinstance(value, dict):
+            _merge_usage(existing, value)
+        elif isinstance(existing, (int, float)) and isinstance(value, (int, float)):
+            base[key] = existing + value
+        else:
+            base[key] = value
+
+
+def extract_usage_from_events(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for event in events:
+        for key in ("usage", "token_usage", "tokens"):
+            value = event.get(key)
+            if isinstance(value, dict):
+                candidates.append(value)
+        _collect_usage_candidates(event, candidates)
+
+    if not candidates:
+        return None
+
+    merged: dict[str, Any] = {}
+    for candidate in candidates:
+        _merge_usage(merged, candidate)
+    return merged or None
 
 
 def run_codex_turn(
@@ -736,6 +866,7 @@ def run_codex_turn(
 
     resolved_session_id = extract_thread_id(events, fallback=session_id)
     parts = normalize_parts(events)
+    usage = extract_usage_from_events(events)
     if meaningful_parts_seen == 0:
         meaningful_parts_seen = count_meaningful_parts(parts)
     now_ms = int(time.time() * 1000)
@@ -755,6 +886,8 @@ def run_codex_turn(
         "parts": parts,
         "_events": events,
     }
+    if usage is not None:
+        assistant_message["info"]["tokens"] = usage
 
     body = {
         "info": {"id": mid},
@@ -762,6 +895,7 @@ def run_codex_turn(
         "_events": events,
         "_message": assistant_message,
         "_session_id": resolved_session_id,
+        "_usage": usage,
         "_stream": {
             "events_observed": len(events),
             "meaningful_parts_seen": meaningful_parts_seen,

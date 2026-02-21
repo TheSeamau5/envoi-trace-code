@@ -344,6 +344,36 @@ def parse_json_maybe(value: Any) -> Any:
     return value
 
 
+def parse_int_maybe(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+    return None
+
+
+def normalize_run_tests_payload(value: Any) -> dict[str, Any] | None:
+    parsed = parse_json_maybe(value)
+    if not isinstance(parsed, dict):
+        return None
+    if "path" in parsed and "timestamp" in parsed:
+        return parsed
+    for nested_key in ("result", "data", "output", "structured_content"):
+        if nested_key in parsed:
+            nested = normalize_run_tests_payload(parsed.get(nested_key))
+            if isinstance(nested, dict):
+                return nested
+    return None
+
+
 def extract_run_tests_call_from_part(part: dict[str, Any]) -> dict[str, Any] | None:
     if str(part.get("tool") or "") != "run_tests":
         return None
@@ -353,21 +383,21 @@ def extract_run_tests_call_from_part(part: dict[str, Any]) -> dict[str, Any] | N
     metadata = state.get("metadata")
     metadata_obj = metadata if isinstance(metadata, dict) else {}
     raw_output = state.get("output") or metadata_obj.get("output")
-    parsed = parse_json_maybe(raw_output)
+    parsed = normalize_run_tests_payload(raw_output)
     if not isinstance(parsed, dict):
         return None
 
     path = parsed.get("path")
     timestamp = parsed.get("timestamp")
-    duration_ms = parsed.get("duration_ms")
-    status_code = parsed.get("status_code")
+    duration_ms = parse_int_maybe(parsed.get("duration_ms"))
+    status_code = parse_int_maybe(parsed.get("status_code"))
     if not isinstance(path, str) or not path:
         return None
     if not isinstance(timestamp, str) or not timestamp:
         return None
-    if not isinstance(duration_ms, int):
+    if duration_ms is None:
         return None
-    if not isinstance(status_code, int):
+    if status_code is None:
         return None
 
     return {
@@ -401,6 +431,77 @@ def stream_part_summary(part: dict[str, Any]) -> str | None:
                 return f"run_tests {test_path}"
         return tool_name or None
     return None
+
+
+def event_token_usage(event_obj: dict[str, Any], part: dict[str, Any]) -> dict[str, Any] | None:
+    properties = event_obj.get("properties")
+    if isinstance(properties, dict):
+        for key in ("usage", "token_usage", "tokens"):
+            value = properties.get(key)
+            if isinstance(value, dict) and value:
+                return value
+    metadata = part.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("usage", "token_usage", "tokens"):
+            value = metadata.get(key)
+            if isinstance(value, dict) and value:
+                return value
+    state = part.get("state")
+    if isinstance(state, dict):
+        for key in ("usage", "token_usage", "tokens"):
+            value = state.get(key)
+            if isinstance(value, dict) and value:
+                return value
+    return None
+
+
+def tool_fields_from_part(
+    part: dict[str, Any],
+) -> tuple[str | None, str | None, Any, Any, Any, int | None]:
+    if str(part.get("type") or "") != "tool":
+        return None, None, None, None, None, None
+
+    tool_name = str(part.get("tool") or "").strip() or None
+    state = part.get("state")
+    if not isinstance(state, dict):
+        return tool_name, None, None, None, None, None
+
+    status_raw = state.get("status")
+    status = str(status_raw) if status_raw is not None else None
+    tool_input = state.get("input")
+    tool_output = state.get("output")
+    tool_error = state.get("error")
+    exit_code = parse_int_maybe(state.get("exit_code"))
+    return tool_name, status, tool_input, tool_output, tool_error, exit_code
+
+
+def merge_usage_maps(base: dict[str, Any], incoming: dict[str, Any]) -> None:
+    for key, value in incoming.items():
+        if key not in base:
+            base[key] = value
+            continue
+        existing = base[key]
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merge_usage_maps(existing, value)
+        elif isinstance(existing, (int, float)) and isinstance(value, (int, float)):
+            base[key] = existing + value
+        else:
+            base[key] = value
+
+
+def extract_usage_from_events(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    usage: dict[str, Any] = {}
+    for event_obj in events:
+        if not isinstance(event_obj, dict):
+            continue
+        properties = event_obj.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        for key in ("usage", "token_usage", "tokens"):
+            candidate = properties.get(key)
+            if isinstance(candidate, dict) and candidate:
+                merge_usage_maps(usage, candidate)
+    return usage or None
 
 
 async def stream_session_events(
@@ -471,14 +572,37 @@ async def stream_session_events(
                                                 )
                                                 if isinstance(name, str) and name:
                                                     files.append(name)
+                                content: str | None = None
+                                if part_type in {"reasoning", "text"}:
+                                    text = part.get("text")
+                                    if isinstance(text, str) and text:
+                                        content = text
+                                (
+                                    tool_name,
+                                    tool_status,
+                                    tool_input,
+                                    tool_output,
+                                    tool_error,
+                                    tool_exit_code,
+                                ) = tool_fields_from_part(part)
                                 trace_event = {
                                     "event": "part.completed",
                                     "role": "assistant",
                                     "part_type": part_type,
                                     "item_type": part_type,
                                     "summary": stream_part_summary(part),
+                                    "content": content,
                                     "has_file_change": part_type == "patch",
                                     "files": files,
+                                    "tool_name": tool_name,
+                                    "tool_status": tool_status,
+                                    "tool_input": tool_input,
+                                    "tool_output": tool_output,
+                                    "tool_error": tool_error,
+                                    "tool_exit_code": tool_exit_code,
+                                    "token_usage": event_token_usage(event_obj, part),
+                                    "provider_part": part,
+                                    "provider_event": event_obj,
                                     "test_call": (
                                         extract_run_tests_call_from_part(part)
                                         if part_type == "tool"
@@ -616,11 +740,14 @@ async def chat_with_stream(
                 pass
 
             body = result.get("body")
+            usage = extract_usage_from_events(events)
             meta = {
                 "events_observed": len(events),
                 "meaningful_parts_seen": meaningful_parts_seen,
                 "aborted_for_part_limit": aborted_for_part_limit,
             }
+            if usage is not None:
+                meta["token_usage"] = usage
             result["meta"] = meta
             if isinstance(body, dict):
                 stream_stats = (
@@ -630,6 +757,8 @@ async def chat_with_stream(
                 )
                 stream_stats.update(meta)
                 body["_stream"] = stream_stats
+                if usage is not None:
+                    body["_usage"] = usage
                 result["body"] = body
             elif meta["aborted_for_part_limit"]:
                 result["body"] = {"_stream": dict(meta)}

@@ -18,6 +18,7 @@ import base64
 import builtins
 import json
 import os
+import re
 import shlex
 import time
 import uuid
@@ -183,6 +184,71 @@ def truncate_text(text: str, limit: int = 4000) -> str:
     return text[:limit] + "\n...[truncated]"
 
 
+WORD_RE = re.compile(r"[A-Za-z0-9_']+")
+
+
+def word_count(text: str | None) -> int:
+    if not isinstance(text, str) or not text:
+        return 0
+    return len(WORD_RE.findall(text))
+
+
+def token_estimate(text: str | None) -> int:
+    if not isinstance(text, str) or not text:
+        return 0
+    # Rough estimate when provider-native token metrics are unavailable.
+    return max(1, round(len(text) / 4))
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def merge_usage_maps(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    for key, value in incoming.items():
+        if key not in base:
+            base[key] = value
+            continue
+        existing = base[key]
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merge_usage_maps(existing, value)
+        elif _is_number(existing) and _is_number(value):
+            base[key] = existing + value
+        else:
+            base[key] = value
+    return base
+
+
+def extract_turn_token_usage(
+    response: dict[str, Any],
+    new_messages: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    usage: dict[str, Any] = {}
+
+    for key in ("_usage", "usage", "token_usage", "tokens"):
+        candidate = response.get(key)
+        if isinstance(candidate, dict):
+            merge_usage_maps(usage, redact_secrets(candidate))
+
+    response_info = response.get("info")
+    if isinstance(response_info, dict):
+        info_tokens = response_info.get("tokens")
+        if isinstance(info_tokens, dict):
+            merge_usage_maps(usage, redact_secrets(info_tokens))
+
+    for message in new_messages:
+        if not isinstance(message, dict):
+            continue
+        info = message.get("info")
+        if not isinstance(info, dict):
+            continue
+        tokens = info.get("tokens")
+        if isinstance(tokens, dict):
+            merge_usage_maps(usage, redact_secrets(tokens))
+
+    return usage or None
+
+
 def redact_secrets(value: Any) -> Any:
     if isinstance(value, dict):
         redacted: dict[str, Any] = {}
@@ -257,6 +323,9 @@ class RepoCheckpoint(BaseModel):
     commit_after: str | None = None
     committed: bool = False
     changed_files: list[str] = Field(default_factory=list)
+    patch: str | None = None
+    stats: str | None = None
+    numstat: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class PartRecord(BaseModel):
@@ -272,6 +341,23 @@ class PartRecord(BaseModel):
     duration_ms: int | None = None
     agent_model: str
     git_commit: str | None = None
+    files: list[str] = Field(default_factory=list)
+    content: str | None = None
+    summary_word_count: int | None = None
+    summary_token_estimate: int | None = None
+    content_word_count: int | None = None
+    content_token_estimate: int | None = None
+    tool_name: str | None = None
+    tool_status: str | None = None
+    tool_input: Any = None
+    tool_output: Any = None
+    tool_error: Any = None
+    tool_exit_code: int | None = None
+    token_usage: dict[str, Any] | None = None
+    provider_part: dict[str, Any] | None = None
+    provider_item: dict[str, Any] | None = None
+    provider_event: dict[str, Any] | None = None
+    patch: str | None = None
     envoi_calls: list[EnvoiCall] = Field(default_factory=list)
     testing_state: TestingState | None = None
     repo_checkpoint: RepoCheckpoint | None = None
@@ -289,6 +375,10 @@ class TurnRecord(BaseModel):
     prompt: str | None = None
     git_commit: str | None = None
     repo_checkpoint: RepoCheckpoint | None = None
+    session_ids: list[str] = Field(default_factory=list)
+    session_objects: list[dict[str, Any]] = Field(default_factory=list)
+    new_messages: list[dict[str, Any]] = Field(default_factory=list)
+    token_usage: dict[str, Any] | None = None
     parts: list[PartRecord] = Field(default_factory=list)
     session_end: SessionEnd | None = None
 
@@ -1167,6 +1257,63 @@ async def get_changed_files(sandbox: modal.Sandbox) -> list[str]:
     return files
 
 
+def parse_numstat_output(stdout: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        columns = line.split("\t")
+        if len(columns) < 3:
+            continue
+        added_raw, deleted_raw, path = columns[0], columns[1], columns[2]
+        added = int(added_raw) if added_raw.isdigit() else None
+        deleted = int(deleted_raw) if deleted_raw.isdigit() else None
+        rows.append(
+            {
+                "path": path,
+                "added": added,
+                "deleted": deleted,
+            }
+        )
+    return rows
+
+
+async def get_commit_patch_payload(
+    sandbox: modal.Sandbox,
+    commit: str,
+) -> tuple[str | None, str | None, list[dict[str, Any]]]:
+    quoted_commit = shlex.quote(commit)
+    patch_text: str | None = None
+    stats_text: str | None = None
+    numstat_rows: list[dict[str, Any]] = []
+
+    patch_exit, patch_stdout, _ = await sandbox_run(
+        sandbox,
+        f"cd /workspace && git show --format= --no-color --patch {quoted_commit}",
+        quiet=True,
+    )
+    if patch_exit == 0:
+        patch_text = patch_stdout
+
+    stats_exit, stats_stdout, _ = await sandbox_run(
+        sandbox,
+        f"cd /workspace && git show --format= --no-color --stat {quoted_commit}",
+        quiet=True,
+    )
+    if stats_exit == 0:
+        stats_text = stats_stdout
+
+    numstat_exit, numstat_stdout, _ = await sandbox_run(
+        sandbox,
+        f"cd /workspace && git show --format= --no-color --numstat {quoted_commit}",
+        quiet=True,
+    )
+    if numstat_exit == 0:
+        numstat_rows = parse_numstat_output(numstat_stdout)
+
+    return patch_text, stats_text, numstat_rows
+
+
 async def create_part_checkpoint(
     sandbox: modal.Sandbox,
     trajectory_id: str,
@@ -1221,6 +1368,14 @@ async def create_part_checkpoint(
         )
 
     commit_after = await get_git_commit(sandbox)
+    patch_text: str | None = None
+    stats_text: str | None = None
+    numstat_rows: list[dict[str, Any]] = []
+    if commit_after:
+        patch_text, stats_text, numstat_rows = await get_commit_patch_payload(
+            sandbox,
+            commit_after,
+        )
 
     print(f"[git] committed part {part}: {commit_after} files={len(changed_files)}")
     return RepoCheckpoint(
@@ -1228,6 +1383,9 @@ async def create_part_checkpoint(
         commit_after=commit_after,
         committed=True,
         changed_files=changed_files,
+        patch=patch_text,
+        stats=stats_text,
+        numstat=numstat_rows,
     )
 
 
@@ -1609,6 +1767,43 @@ def make_stream_part_callback(
             item_type = item_type_value if isinstance(item_type_value, str) else None
             summary_value = stream_event.get("summary")
             summary = summary_value if isinstance(summary_value, str) and summary_value else None
+            content_value = stream_event.get("content")
+            content = content_value if isinstance(content_value, str) else None
+            tool_name_value = stream_event.get("tool_name")
+            tool_name = tool_name_value if isinstance(tool_name_value, str) else None
+            tool_status_value = stream_event.get("tool_status")
+            tool_status = tool_status_value if isinstance(tool_status_value, str) else None
+            tool_exit_code_value = stream_event.get("tool_exit_code")
+            tool_exit_code = (
+                tool_exit_code_value if isinstance(tool_exit_code_value, int) else None
+            )
+            token_usage_value = stream_event.get("token_usage")
+            token_usage = (
+                redact_secrets(token_usage_value)
+                if isinstance(token_usage_value, dict)
+                else None
+            )
+            provider_part_value = stream_event.get("provider_part")
+            provider_part = (
+                redact_secrets(provider_part_value)
+                if isinstance(provider_part_value, dict)
+                else None
+            )
+            provider_item_value = stream_event.get("provider_item")
+            provider_item = (
+                redact_secrets(provider_item_value)
+                if isinstance(provider_item_value, dict)
+                else None
+            )
+            provider_event_value = stream_event.get("provider_event")
+            provider_event = (
+                redact_secrets(provider_event_value)
+                if isinstance(provider_event_value, dict)
+                else None
+            )
+            tool_input = redact_secrets(stream_event.get("tool_input"))
+            tool_output = redact_secrets(stream_event.get("tool_output"))
+            tool_error = redact_secrets(stream_event.get("tool_error"))
             role_value = stream_event.get("role")
             role: Literal["assistant", "user"] = (
                 role_value
@@ -1657,6 +1852,8 @@ def make_stream_part_callback(
                     )
                 if files and not checkpoint.changed_files:
                     checkpoint.changed_files = files
+                if checkpoint.changed_files and not files:
+                    files = list(checkpoint.changed_files)
                 git_commit_ref[0] = (
                     checkpoint.commit_after
                     or checkpoint.commit_before
@@ -1686,6 +1883,23 @@ def make_stream_part_callback(
                 duration_ms=duration_ms,
                 agent_model=resolved_model,
                 git_commit=git_commit_ref[0],
+                files=files,
+                content=content,
+                summary_word_count=word_count(summary),
+                summary_token_estimate=token_estimate(summary),
+                content_word_count=word_count(content),
+                content_token_estimate=token_estimate(content),
+                tool_name=tool_name,
+                tool_status=tool_status,
+                tool_input=tool_input,
+                tool_output=tool_output,
+                tool_error=tool_error,
+                tool_exit_code=tool_exit_code,
+                token_usage=token_usage,
+                provider_part=provider_part,
+                provider_item=provider_item,
+                provider_event=provider_event,
+                patch=checkpoint.patch if checkpoint else None,
                 envoi_calls=part_envoi_calls,
                 testing_state=tracker.snapshot(),
                 repo_checkpoint=checkpoint,
@@ -1981,8 +2195,14 @@ async def _run_trajectory_impl(
                 log_message_parts(response)
 
                 session_ids = turn_outcome.session_ids
+                session_objects = turn_outcome.session_objects
                 new_messages = turn_outcome.new_messages
                 print(f"[progress] new_messages={len(new_messages)} sessions={len(session_ids)}")
+                if turn_record is not None:
+                    turn_record.session_ids = session_ids
+                    turn_record.session_objects = session_objects
+                    turn_record.new_messages = new_messages
+                    turn_record.token_usage = extract_turn_token_usage(response, new_messages)
 
                 # Extract envoi calls from newly observed messages only.
                 new_envoi_calls: list[EnvoiCall] = []
