@@ -20,7 +20,7 @@ from pathlib import Path
 
 import envoi
 
-from .utils import TestResult, run_case, select_cases, to_result
+from .utils import TestResult, fixture_path, run_case, select_cases, to_result
 
 torture = envoi.suite("torture")
 
@@ -58,7 +58,14 @@ async def run_torture(
 ) -> TestResult:
     part_size = 40
     blacklist = load_blacklist()
-    torture_dir = Path("/opt/tests/llvm-test-suite/SingleSource/Regression/C/gcc-c-torture/execute")
+    torture_dir = fixture_path(
+        "llvm-test-suite",
+        "SingleSource",
+        "Regression",
+        "C",
+        "gcc-c-torture",
+        "execute",
+    )
     if not torture_dir.is_dir():
         raise RuntimeError(f"Missing torture fixtures directory: {torture_dir}")
     source_files = sorted(

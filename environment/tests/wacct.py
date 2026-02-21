@@ -16,7 +16,7 @@ from pathlib import Path
 
 import envoi
 
-from .utils import TestResult, run_case, select_cases, to_result
+from .utils import TestResult, fixture_path, run_case, select_cases, to_result
 
 wacct = envoi.suite("wacct")
 
@@ -42,8 +42,8 @@ async def run_wacct_tests(
     test_name: str | None = None,
     offset: int = 0,
 ) -> TestResult:
-    tests_dir = Path("/opt/tests/wacct/tests")
-    expected_path = Path("/opt/tests/wacct/expected_results.json")
+    tests_dir = fixture_path("wacct", "tests")
+    expected_path = fixture_path("wacct", "expected_results.json")
     if not tests_dir.is_dir():
         raise RuntimeError(f"Missing WACCT fixtures directory: {tests_dir}")
     if not expected_path.is_file():

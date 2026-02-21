@@ -13,11 +13,10 @@ Routes:
 from __future__ import annotations
 
 import math
-from pathlib import Path
 
 import envoi
 
-from .utils import TestResult, run_case, select_cases, to_result
+from .utils import TestResult, fixture_path, run_case, select_cases, to_result
 
 c_testsuite = envoi.suite("c_testsuite")
 
@@ -43,7 +42,7 @@ async def run_c_testsuite(
     test_name: str | None = None,
     offset: int = 0,
 ) -> TestResult:
-    tests_dir = Path("/opt/tests/c-testsuite/tests/single-exec")
+    tests_dir = fixture_path("c-testsuite", "tests", "single-exec")
     part_size = 48
     if not tests_dir.is_dir():
         raise RuntimeError(f"Missing c-testsuite fixtures directory: {tests_dir}")

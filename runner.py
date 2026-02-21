@@ -35,6 +35,7 @@ from agents.opencode import OPENCODE_CONFIG_TEMPLATE
 from task import (
     TASK_REQUIRED_TEST_PATHS,
     TASK_SANDBOX_SETUP_SH,
+    TASK_SUITE_PATHS,
     TASK_SYSTEM_PROMPT,
     build_followup_prompt,
 )
@@ -57,6 +58,10 @@ SECONDS_PER_REMAINING_PART = int(
 )  # adaptive cap as part budget gets tight
 TRACE_EVENT_PREFIX = "TRACE_EVENT "
 SETUP_UPLOAD_CONCURRENCY = max(1, int(os.environ.get("SETUP_UPLOAD_CONCURRENCY", "8")))
+EVALUATION_CONCURRENCY = max(1, int(os.environ.get("EVALUATION_CONCURRENCY", "1")))
+EVALUATION_TIMEOUT_SECONDS = max(60, int(os.environ.get("EVALUATION_TIMEOUT_SECONDS", "7200")))
+EVALUATION_ENVOI_URL = os.environ.get("EVALUATION_ENVOI_URL", "http://localhost:8000").strip() or "http://localhost:8000"
+EVALUATION_JSON_MARKER = "__ENVOI_EVAL_JSON__"
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +333,25 @@ class RepoCheckpoint(BaseModel):
     numstat: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class EvaluationRecord(BaseModel):
+    commit: str
+    part: int
+    status: Literal["queued", "running", "completed", "failed"] = "queued"
+    queued_at: str
+    started_at: str | None = None
+    completed_at: str | None = None
+    duration_ms: int | None = None
+    passed: int = 0
+    failed: int = 0
+    total: int = 0
+    suite_results: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+    command: str | None = None
+    exit_code: int | None = None
+    stdout: str | None = None
+    stderr: str | None = None
+
+
 class PartRecord(BaseModel):
     trajectory_id: str
     session_id: str
@@ -391,6 +415,7 @@ class AgentTrace(BaseModel):
     started_at: str
     parts: list[PartRecord] = Field(default_factory=list)
     turns: list[TurnRecord] = Field(default_factory=list)
+    evaluations: dict[str, EvaluationRecord] = Field(default_factory=dict)
     artifacts: dict[str, str | None] = Field(default_factory=dict)
     session_end: SessionEnd | None = None
 
@@ -754,7 +779,6 @@ sandbox_image = (
     )
     .run_commands("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y")
 )
-
 
 # ---------------------------------------------------------------------------
 # Sandbox helpers
@@ -1389,6 +1413,130 @@ async def create_part_checkpoint(
     )
 
 
+def build_commit_evaluation_command(*, commit: str, eval_repo_dir: str) -> str:
+    suite_paths_json = json.dumps(list(TASK_SUITE_PATHS))
+    repo_dir_json = json.dumps(eval_repo_dir)
+    envoi_url_json = json.dumps(EVALUATION_ENVOI_URL)
+    marker_json = json.dumps(EVALUATION_JSON_MARKER)
+    quoted_commit = shlex.quote(commit)
+    quoted_repo_dir = shlex.quote(eval_repo_dir)
+    return (
+        "set -euo pipefail\n"
+        f"repo_dir={quoted_repo_dir}\n"
+        "rm -rf \"$repo_dir\"\n"
+        "git clone -q /workspace \"$repo_dir\"\n"
+        "cd \"$repo_dir\"\n"
+        f"git checkout -q {quoted_commit}\n"
+        "python3 - <<'PY'\n"
+        "import asyncio\n"
+        "import json\n"
+        "import time\n"
+        "import traceback\n"
+        "import envoi\n"
+        f"repo_dir = {repo_dir_json}\n"
+        f"suite_paths = {suite_paths_json}\n"
+        f"envoi_url = {envoi_url_json}\n"
+        f"marker = {marker_json}\n"
+        "async def _main() -> None:\n"
+        "    started_at = time.monotonic()\n"
+        "    payload = {\n"
+        "        'duration_ms': 0,\n"
+        "        'passed': 0,\n"
+        "        'failed': 0,\n"
+        "        'total': 0,\n"
+        "        'suite_results': {},\n"
+        "        'error': None,\n"
+        "    }\n"
+        "    try:\n"
+        "        docs = envoi.Documents(repo_dir)\n"
+        "        async with await envoi.connect_session(\n"
+        "            envoi_url,\n"
+        "            submission=docs,\n"
+        "            session_timeout_seconds=7200,\n"
+        "        ) as session:\n"
+        "            for suite_path in suite_paths:\n"
+        "                suite_payload = {\n"
+        "                    'ok': False,\n"
+        "                    'passed': 0,\n"
+        "                    'failed': 0,\n"
+        "                    'total': 0,\n"
+        "                    'error': None,\n"
+        "                    'result': None,\n"
+        "                }\n"
+        "                try:\n"
+        "                    result = await session.test(suite_path)\n"
+        "                    suite_payload['result'] = result\n"
+        "                    if isinstance(result, dict):\n"
+        "                        suite_payload['passed'] = int(result.get('passed', 0) or 0)\n"
+        "                        suite_payload['failed'] = int(result.get('failed', 0) or 0)\n"
+        "                        suite_payload['total'] = int(result.get('total', 0) or 0)\n"
+        "                        suite_payload['ok'] = (\n"
+        "                            suite_payload['failed'] == 0 and suite_payload['total'] > 0\n"
+        "                        )\n"
+        "                    else:\n"
+        "                        suite_payload['error'] = (\n"
+        "                            f'Unexpected result type: {type(result).__name__}'\n"
+        "                        )\n"
+        "                except Exception as suite_error:  # noqa: BLE001\n"
+        "                    suite_payload['error'] = str(suite_error)\n"
+        "                    suite_payload['traceback'] = traceback.format_exc()\n"
+        "                payload['suite_results'][suite_path] = suite_payload\n"
+        "                payload['passed'] += int(suite_payload.get('passed', 0) or 0)\n"
+        "                payload['failed'] += int(suite_payload.get('failed', 0) or 0)\n"
+        "                payload['total'] += int(suite_payload.get('total', 0) or 0)\n"
+        "    except Exception as error:  # noqa: BLE001\n"
+        "        payload['error'] = str(error)\n"
+        "        payload['traceback'] = traceback.format_exc()\n"
+        "    finally:\n"
+        "        payload['duration_ms'] = int((time.monotonic() - started_at) * 1000)\n"
+        "    print(marker + json.dumps(payload, ensure_ascii=False))\n"
+        "asyncio.run(_main())\n"
+        "PY\n"
+        "status=$?\n"
+        "cd /workspace\n"
+        "rm -rf \"$repo_dir\"\n"
+        "exit $status\n"
+    )
+
+
+def parse_commit_evaluation_payload(stdout: str) -> dict[str, Any] | None:
+    for line in reversed(stdout.splitlines()):
+        if not line.startswith(EVALUATION_JSON_MARKER):
+            continue
+        raw_json = line[len(EVALUATION_JSON_MARKER) :].strip()
+        if not raw_json:
+            continue
+        try:
+            parsed = json.loads(raw_json)
+        except Exception:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+async def run_commit_evaluation(
+    *,
+    sandbox: modal.Sandbox,
+    commit: str,
+) -> dict[str, Any]:
+    eval_repo_dir = f"/tmp/envoi-eval-{commit[:12]}-{uuid.uuid4().hex[:8]}"
+    command = build_commit_evaluation_command(commit=commit, eval_repo_dir=eval_repo_dir)
+    exit_code, stdout, stderr = await sandbox_run(
+        sandbox,
+        command,
+        timeout=EVALUATION_TIMEOUT_SECONDS,
+        quiet=True,
+    )
+    payload = parse_commit_evaluation_payload(stdout)
+    return {
+        "command": command,
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "payload": payload,
+    }
+
+
 async def ensure_provider_connected(sandbox: modal.Sandbox, api_key: str) -> None:
     response = await run_opencode_client(
         sandbox,
@@ -1743,6 +1891,7 @@ def make_stream_part_callback(
     last_part_timestamp_ms_ref: list[int | None],
     turn_record: TurnRecord | None,
     session_id: str,
+    schedule_commit_evaluation: Callable[[str, int], None] | None = None,
 ) -> Callable[[dict[str, Any]], Awaitable[None]]:
     async def on_stream_part(stream_event: dict[str, Any]) -> None:
         if turn_record is None:
@@ -1859,6 +2008,13 @@ def make_stream_part_callback(
                     or checkpoint.commit_before
                     or git_commit_ref[0]
                 )
+                if (
+                    checkpoint.committed
+                    and isinstance(checkpoint.commit_after, str)
+                    and checkpoint.commit_after
+                    and schedule_commit_evaluation is not None
+                ):
+                    schedule_commit_evaluation(checkpoint.commit_after, absolute_part)
 
             part_envoi_calls: list[EnvoiCall] = []
             raw_test_call = stream_event.get("test_call")
@@ -2051,6 +2207,7 @@ async def _run_trajectory_impl(
     turn_count = 0
     part_count = 0
     end_reason: str | None = None
+    wait_for_evaluations_fn: Callable[[], Awaitable[None]] | None = None
 
     try:
         sandbox = await modal.Sandbox.create.aio(
@@ -2080,6 +2237,168 @@ async def _run_trajectory_impl(
             started_at=datetime.now(UTC).isoformat(),
         )
         save_agent_trace_snapshot(trajectory_id, agent_trace)
+
+        evaluation_tasks: set[asyncio.Task[None]] = set()
+        evaluation_commits: set[str] = set()
+        evaluation_semaphore = asyncio.Semaphore(EVALUATION_CONCURRENCY)
+
+        def schedule_commit_evaluation(commit: str, part: int) -> None:
+            if commit in evaluation_commits:
+                return
+            evaluation_commits.add(commit)
+            queued_at = datetime.now(UTC).isoformat()
+            print(f"[eval] queued commit {commit[:10]} from part {part}")
+            agent_trace.evaluations[commit] = EvaluationRecord(
+                commit=commit,
+                part=part,
+                status="queued",
+                queued_at=queued_at,
+            )
+            save_agent_trace_snapshot(trajectory_id, agent_trace)
+
+            async def _runner() -> None:
+                started_at = datetime.now(UTC).isoformat()
+                evaluation = agent_trace.evaluations.get(commit)
+                if evaluation is None:
+                    evaluation = EvaluationRecord(
+                        commit=commit,
+                        part=part,
+                        status="queued",
+                        queued_at=queued_at,
+                    )
+                    agent_trace.evaluations[commit] = evaluation
+                evaluation.status = "running"
+                evaluation.started_at = started_at
+                save_agent_trace_snapshot(trajectory_id, agent_trace)
+
+                async with evaluation_semaphore:
+                    run_payload: dict[str, Any] | None = None
+                    started_mono = time.monotonic()
+                    try:
+                        run_payload = await run_commit_evaluation(
+                            sandbox=sandbox,
+                            commit=commit,
+                        )
+                        payload = run_payload.get("payload")
+                        exit_code_value = run_payload.get("exit_code")
+                        stdout_value = run_payload.get("stdout")
+                        stderr_value = run_payload.get("stderr")
+                        command_value = run_payload.get("command")
+
+                        evaluation.command = (
+                            command_value if isinstance(command_value, str) else None
+                        )
+                        evaluation.exit_code = (
+                            exit_code_value if isinstance(exit_code_value, int) else None
+                        )
+                        raw_stdout = stdout_value if isinstance(stdout_value, str) else None
+                        raw_stderr = stderr_value if isinstance(stderr_value, str) else None
+
+                        if (
+                            isinstance(evaluation.exit_code, int)
+                            and evaluation.exit_code != 0
+                        ):
+                            evaluation.status = "failed"
+                            evaluation.error = (
+                                f"Evaluation command failed with exit code {evaluation.exit_code}"
+                            )
+                            evaluation.stdout = raw_stdout
+                            evaluation.stderr = raw_stderr
+                            evaluation.passed = 0
+                            evaluation.failed = 0
+                            evaluation.total = 0
+                            evaluation.suite_results = {}
+                        elif not isinstance(payload, dict):
+                            evaluation.status = "failed"
+                            evaluation.error = "Missing evaluation payload in command output"
+                            evaluation.stdout = raw_stdout
+                            evaluation.stderr = raw_stderr
+                            evaluation.passed = 0
+                            evaluation.failed = 0
+                            evaluation.total = 0
+                            evaluation.suite_results = {}
+                        else:
+                            evaluation.status = "completed"
+                            evaluation.error = (
+                                payload.get("error")
+                                if isinstance(payload.get("error"), str)
+                                else None
+                            )
+                            if evaluation.error:
+                                evaluation.stdout = raw_stdout
+                                evaluation.stderr = raw_stderr
+                            else:
+                                evaluation.stdout = None
+                                evaluation.stderr = None
+                            evaluation.duration_ms = int(
+                                payload.get("duration_ms", 0) or 0
+                            )
+                            evaluation.passed = int(payload.get("passed", 0) or 0)
+                            evaluation.failed = int(payload.get("failed", 0) or 0)
+                            evaluation.total = int(payload.get("total", 0) or 0)
+                            suite_results = payload.get("suite_results")
+                            if isinstance(suite_results, dict):
+                                evaluation.suite_results = suite_results
+                            else:
+                                evaluation.suite_results = {}
+                    except Exception as eval_error:
+                        evaluation.status = "failed"
+                        evaluation.error = str(eval_error)
+                        evaluation.passed = 0
+                        evaluation.failed = 0
+                        evaluation.total = 0
+                        evaluation.suite_results = {}
+                        if run_payload is not None:
+                            exit_code_value = run_payload.get("exit_code")
+                            stdout_value = run_payload.get("stdout")
+                            stderr_value = run_payload.get("stderr")
+                            command_value = run_payload.get("command")
+                            evaluation.command = (
+                                command_value if isinstance(command_value, str) else None
+                            )
+                            evaluation.exit_code = (
+                                exit_code_value if isinstance(exit_code_value, int) else None
+                            )
+                            evaluation.stdout = (
+                                stdout_value if isinstance(stdout_value, str) else None
+                            )
+                            evaluation.stderr = (
+                                stderr_value if isinstance(stderr_value, str) else None
+                            )
+                    finally:
+                        if evaluation.duration_ms is None:
+                            evaluation.duration_ms = int(
+                                (time.monotonic() - started_mono) * 1000
+                            )
+                        evaluation.completed_at = datetime.now(UTC).isoformat()
+                        print(
+                            f"[eval] commit {commit[:10]} status={evaluation.status} "
+                            f"passed={evaluation.passed}/{evaluation.total}"
+                        )
+                        save_agent_trace_snapshot(trajectory_id, agent_trace)
+
+            task = asyncio.create_task(_runner())
+            evaluation_tasks.add(task)
+
+            def _on_done(done_task: asyncio.Task[None]) -> None:
+                evaluation_tasks.discard(done_task)
+                try:
+                    done_task.result()
+                except Exception as task_error:
+                    print(
+                        f"[eval] unexpected task error for commit {commit}: {task_error}"
+                    )
+
+            task.add_done_callback(_on_done)
+
+        async def _wait_for_evaluations() -> None:
+            while evaluation_tasks:
+                pending = list(evaluation_tasks)
+                if not pending:
+                    break
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        wait_for_evaluations_fn = _wait_for_evaluations
 
         # --- Main loop: blocking message calls with part budget ---
         tracker = SolveTracker(list(TASK_REQUIRED_TEST_PATHS))
@@ -2158,6 +2477,7 @@ async def _run_trajectory_impl(
                     last_part_timestamp_ms_ref=stream_last_part_ts_ref,
                     turn_record=turn_record,
                     session_id=session_id,
+                    schedule_commit_evaluation=schedule_commit_evaluation,
                 )
 
                 # Send message and BLOCK until agent finishes
@@ -2344,6 +2664,8 @@ async def _run_trajectory_impl(
                 print("[error] could not save crash messages")
 
         # Always end the session and save final state
+        if wait_for_evaluations_fn is not None:
+            await wait_for_evaluations_fn()
         await end_session(
             sandbox,
             agent_trace,
@@ -2357,6 +2679,8 @@ async def _run_trajectory_impl(
         print(f"[error] {e}")
         if sandbox is not None and agent_trace is not None:
             try:
+                if wait_for_evaluations_fn is not None:
+                    await wait_for_evaluations_fn()
                 await end_session(
                     sandbox,
                     agent_trace,

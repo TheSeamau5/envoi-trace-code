@@ -33,8 +33,8 @@ import httpx
 from task import TASK_HEAVY_TEST_ROOTS, TASK_REQUIRED_TEST_PATHS, TASK_SUITE_PATHS
 
 REQUIRED_PATHS: list[str] = list(TASK_REQUIRED_TEST_PATHS)
-HEAVY_TEST_ROOTS: dict[str, Path] = {k: Path(v) for k, v in TASK_HEAVY_TEST_ROOTS.items()}
 SUITE_PATHS: list[str] = list(TASK_SUITE_PATHS)
+DEFAULT_TASK_FIXTURES_ROOT = Path("/opt/tests")
 
 
 @dataclass
@@ -107,7 +107,7 @@ async def wait_for_runtime(url: str, timeout_seconds: int = 60) -> None:
     raise TimeoutError(f"Timed out waiting for runtime at {url}")
 
 
-async def start_runtime(environment_file: Path, port: int) -> RuntimeHandle:
+async def start_runtime(environment_file: Path, port: int, fixtures_root: Path) -> RuntimeHandle:
     command = [
         "python",
         "-m",
@@ -119,11 +119,15 @@ async def start_runtime(environment_file: Path, port: int) -> RuntimeHandle:
         "--port",
         str(port),
     ]
+    runtime_env = os.environ.copy()
+    runtime_env["ENVOI_TESTS_ROOT"] = str(fixtures_root)
+
     process = subprocess.Popen(  # noqa: S603
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=runtime_env,
     )
     url = f"http://127.0.0.1:{port}"
     try:
@@ -166,13 +170,142 @@ def checkout_commit(repo_path: Path, commit: str) -> None:
     )
 
 
-def has_required_test_fixtures(test_paths: list[str]) -> tuple[bool, list[str]]:
+def default_fixtures_root() -> Path:
+    env_root = os.environ.get("ENVOI_TESTS_ROOT")
+    if env_root:
+        return Path(env_root).expanduser().resolve()
+
+    if DEFAULT_TASK_FIXTURES_ROOT.exists():
+        return DEFAULT_TASK_FIXTURES_ROOT
+
+    if os.access(DEFAULT_TASK_FIXTURES_ROOT.parent, os.W_OK):
+        return DEFAULT_TASK_FIXTURES_ROOT
+
+    return (Path.home() / ".cache" / "envoi-tests").resolve()
+
+
+def resolve_fixture_roots(fixtures_root: Path) -> dict[str, Path]:
+    roots: dict[str, Path] = {}
+    for suite, configured in TASK_HEAVY_TEST_ROOTS.items():
+        configured_path = Path(configured)
+        if configured_path.is_absolute():
+            try:
+                rel = configured_path.relative_to(DEFAULT_TASK_FIXTURES_ROOT)
+                roots[suite] = fixtures_root / rel
+            except ValueError:
+                roots[suite] = configured_path
+        else:
+            roots[suite] = fixtures_root / configured_path
+    return roots
+
+
+def has_required_test_fixtures(
+    test_paths: list[str],
+    fixtures_root: Path,
+) -> tuple[bool, list[str]]:
+    heavy_roots = resolve_fixture_roots(fixtures_root)
     missing: list[str] = []
-    for key, root in HEAVY_TEST_ROOTS.items():
+    for key, root in heavy_roots.items():
         needed = any(path == key or path.startswith(f"{key}/") for path in test_paths)
-        if needed and not root.exists():
+        if not needed:
+            continue
+        if key == "wacct":
+            expected = root.parent / "expected_results.json"
+            if not root.is_dir() or not expected.is_file():
+                missing.append(str(root))
+        elif key in {"c_testsuite", "torture"}:
+            if not root.is_dir() or not any(root.glob("*.c")):
+                missing.append(str(root))
+        elif not root.exists():
             missing.append(str(root))
     return len(missing) == 0, missing
+
+
+def run_cmd(command: list[str], cwd: Path | None = None) -> None:
+    subprocess.run(  # noqa: S603
+        command,
+        check=True,
+        cwd=str(cwd) if cwd else None,
+    )
+
+
+def ensure_required_test_fixtures(test_paths: list[str], fixtures_root: Path) -> None:
+    heavy_roots = resolve_fixture_roots(fixtures_root)
+    needed = {
+        key
+        for key in heavy_roots
+        if any(path == key or path.startswith(f"{key}/") for path in test_paths)
+    }
+    if not needed:
+        return
+
+    fixtures_root.mkdir(parents=True, exist_ok=True)
+
+    if "c_testsuite" in needed:
+        tests_dir = heavy_roots["c_testsuite"]
+        if not tests_dir.is_dir() or not any(tests_dir.glob("*.c")):
+            clone_dir = tests_dir.parents[1]
+            shutil.rmtree(clone_dir, ignore_errors=True)
+            clone_dir.parent.mkdir(parents=True, exist_ok=True)
+            print(f"[fixtures] syncing c-testsuite into {clone_dir}")
+            run_cmd(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/c-testsuite/c-testsuite.git",
+                    str(clone_dir),
+                ]
+            )
+
+    if "wacct" in needed:
+        tests_dir = heavy_roots["wacct"]
+        wacct_root = tests_dir.parent
+        expected = wacct_root / "expected_results.json"
+        if not tests_dir.is_dir() or not expected.is_file():
+            shutil.rmtree(wacct_root, ignore_errors=True)
+            wacct_root.parent.mkdir(parents=True, exist_ok=True)
+            print(f"[fixtures] syncing writing-a-c-compiler-tests into {wacct_root}")
+            run_cmd(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/nlsandler/writing-a-c-compiler-tests.git",
+                    str(wacct_root),
+                ]
+            )
+
+    if "torture" in needed:
+        tests_dir = heavy_roots["torture"]
+        llvm_root = tests_dir.parents[4]
+        if not tests_dir.is_dir() or not any(tests_dir.glob("*.c")):
+            shutil.rmtree(llvm_root, ignore_errors=True)
+            llvm_root.mkdir(parents=True, exist_ok=True)
+            print(f"[fixtures] syncing llvm-test-suite torture shard into {llvm_root}")
+            run_cmd(["git", "init"], cwd=llvm_root)
+            run_cmd(
+                [
+                    "git",
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/llvm/llvm-test-suite.git",
+                ],
+                cwd=llvm_root,
+            )
+            run_cmd(["git", "config", "core.sparseCheckout", "true"], cwd=llvm_root)
+            sparse_file = llvm_root / ".git" / "info" / "sparse-checkout"
+            sparse_file.parent.mkdir(parents=True, exist_ok=True)
+            sparse_file.write_text("SingleSource/Regression/C/gcc-c-torture/execute/\n")
+            run_cmd(["git", "pull", "--depth", "1", "origin", "main"], cwd=llvm_root)
+
+    fixtures_ok, missing = has_required_test_fixtures(test_paths, fixtures_root)
+    if not fixtures_ok:
+        joined = "\n".join(f"- {p}" for p in missing)
+        raise RuntimeError(f"Missing required test fixtures after sync attempt:\n{joined}")
 
 
 def parse_commit_from_part(part: dict[str, Any]) -> str | None:
@@ -417,7 +550,9 @@ async def replay_trace(
     output_path: Path,
     environment_file: Path,
     test_paths: list[str],
+    fixtures_root: Path | None,
 ) -> dict[str, Any]:
+    fixtures_root = fixtures_root or default_fixtures_root()
     trace = load_agent_trace(trace_path)
     parts = extract_part_rows(trace)
     commit_order = get_unique_commits(parts)
@@ -425,17 +560,18 @@ async def replay_trace(
     if not commit_order:
         raise ValueError("No commits found in trace parts")
 
-    fixtures_ok, missing_fixtures = has_required_test_fixtures(test_paths)
-    if not fixtures_ok:
-        missing = "\n".join(f"- {p}" for p in missing_fixtures)
-        raise RuntimeError(f"Missing required test fixtures. Expected paths:\n{missing}")
+    ensure_required_test_fixtures(test_paths, fixtures_root)
 
     workspace_root = Path(tempfile.mkdtemp(prefix="envoi-replay-")).resolve()
     repo_path = workspace_root / "repo"
     clone_bundle(bundle_path, repo_path)
 
     runtime_port = find_free_port()
-    runtime = await start_runtime(environment_file=environment_file, port=runtime_port)
+    runtime = await start_runtime(
+        environment_file=environment_file,
+        port=runtime_port,
+        fixtures_root=fixtures_root,
+    )
 
     commit_evals: dict[str, Any] = {}
     try:
@@ -471,6 +607,7 @@ async def replay_trace(
             "bundle_path": str(bundle_path),
             "environment_file": str(environment_file),
             "test_paths": test_paths,
+            "fixtures_root": str(fixtures_root),
         },
         "commits_evaluated": commit_order,
         "commit_evaluations": commit_evals,
@@ -677,7 +814,9 @@ async def analyze_trace(
     bundle_path: Path,
     output_path: Path,
     environment_file: Path,
+    fixtures_root: Path | None,
 ) -> dict[str, Any]:
+    fixtures_root = fixtures_root or default_fixtures_root()
     """Pull trace + bundle, evaluate every commit by suite, produce summary table."""
     trace = load_agent_trace(trace_path)
     turn_stats = extract_turn_stats(trace)
@@ -691,19 +830,20 @@ async def analyze_trace(
     if not commit_order:
         raise ValueError("No commits found in trace turns")
 
-    fixtures_ok, missing_fixtures = has_required_test_fixtures(SUITE_PATHS)
-    if not fixtures_ok:
-        missing = "\n".join(f"- {p}" for p in missing_fixtures)
-        raise RuntimeError(f"Missing required test fixtures:\n{missing}")
+    ensure_required_test_fixtures(SUITE_PATHS, fixtures_root)
 
     workspace_root = Path(tempfile.mkdtemp(prefix="envoi-analyze-")).resolve()
     repo_path = workspace_root / "repo"
     clone_bundle(bundle_path, repo_path)
 
     runtime_port = find_free_port()
-    runtime = await start_runtime(environment_file=environment_file, port=runtime_port)
+    runtime = await start_runtime(
+        environment_file=environment_file,
+        port=runtime_port,
+        fixtures_root=fixtures_root,
+    )
 
-    commit_evals: dict[str, Any] = {}
+    commit_evals = {}
     try:
         for index, commit in enumerate(commit_order, start=1):
             print(f"[analyze] evaluating commit {index}/{len(commit_order)}: {commit[:10]}")
@@ -740,6 +880,7 @@ async def analyze_trace(
         "agent_model": trace.get("agent_model"),
         "started_at": trace.get("started_at"),
         "generated_at": now_iso(),
+        "fixtures_root": str(fixtures_root),
         "summary": summary_rows,
         "commits_evaluated": commit_order,
         "commit_evaluations": commit_evals,
@@ -809,6 +950,14 @@ async def async_main() -> None:
         help="Path to the envoi environment module (used in --mode evaluate)",
     )
     parser.add_argument(
+        "--fixtures-root",
+        default=None,
+        help=(
+            "Fixtures root for heavy suites. Defaults to ENVOI_TESTS_ROOT if set, "
+            "otherwise /opt/tests when writable/present, else ~/.cache/envoi-tests."
+        ),
+    )
+    parser.add_argument(
         "--test-path",
         action="append",
         dest="test_paths",
@@ -863,6 +1012,11 @@ async def async_main() -> None:
         environment_file = Path(args.environment_file).expanduser().resolve()
         if not environment_file.exists():
             raise FileNotFoundError(f"Environment file not found: {environment_file}")
+        fixtures_root = (
+            Path(args.fixtures_root).expanduser().resolve()
+            if args.fixtures_root
+            else default_fixtures_root()
+        )
 
         if args.mode == "analyze":
             report = await analyze_trace(
@@ -870,6 +1024,7 @@ async def async_main() -> None:
                 bundle_path=bundle_path,
                 output_path=output_path,
                 environment_file=environment_file,
+                fixtures_root=fixtures_root,
             )
         else:
             test_paths = args.test_paths if args.test_paths else list(REQUIRED_PATHS)
@@ -879,6 +1034,7 @@ async def async_main() -> None:
                 output_path=output_path,
                 environment_file=environment_file,
                 test_paths=test_paths,
+                fixtures_root=fixtures_root,
             )
     finally:
         shutil.rmtree(scratch, ignore_errors=True)

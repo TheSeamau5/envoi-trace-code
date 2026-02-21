@@ -62,6 +62,15 @@ def session_path() -> Path:
         return Path.cwd()
 
 
+def fixtures_root() -> Path:
+    root = os.environ.get("ENVOI_TESTS_ROOT", "/opt/tests")
+    return Path(root).expanduser().resolve()
+
+
+def fixture_path(*parts: str) -> Path:
+    return fixtures_root().joinpath(*parts)
+
+
 def file_size(path: Path) -> int | None:
     try:
         return os.path.getsize(path)
