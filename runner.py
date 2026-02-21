@@ -620,30 +620,6 @@ def extract_envoi_calls(message_parts: list[dict[str, Any]]) -> list[EnvoiCall]:
     """Extract envoi test calls from message parts."""
     calls: list[EnvoiCall] = []
 
-    def parse_envoi_call(value: Any) -> EnvoiCall | None:
-        if isinstance(value, str):
-            text = value.strip()
-            if not text:
-                return None
-            try:
-                parsed = json.loads(text)
-            except json.JSONDecodeError:
-                return None
-            return parse_envoi_call(parsed)
-
-        if isinstance(value, dict):
-            if "path" in value and "timestamp" in value:
-                try:
-                    return EnvoiCall(**value)
-                except Exception:
-                    pass
-            for nested_key in ("result", "data", "output", "structured_content"):
-                if nested_key in value:
-                    parsed_nested = parse_envoi_call(value.get(nested_key))
-                    if parsed_nested is not None:
-                        return parsed_nested
-        return None
-
     # Handle tool_use + tool_result pairs (older format)
     tool_results: dict[str, dict[str, Any]] = {}
     for part in message_parts:
@@ -654,7 +630,7 @@ def extract_envoi_calls(message_parts: list[dict[str, Any]]) -> list[EnvoiCall]:
             tool_result = tool_results.get(part.get("id", ""))
             if tool_result:
                 content = tool_result.get("content", "")
-                parsed_call = parse_envoi_call(content)
+                parsed_call = parse_envoi_call_payload(content)
                 if parsed_call is not None:
                     calls.append(parsed_call)
         # Handle "tool" type parts (OpenCode's actual format)
@@ -662,10 +638,35 @@ def extract_envoi_calls(message_parts: list[dict[str, Any]]) -> list[EnvoiCall]:
             state = part.get("state", {})
             if state.get("status") == "completed":
                 output = state.get("output") or state.get("metadata", {}).get("output") or ""
-                parsed_call = parse_envoi_call(output)
+                parsed_call = parse_envoi_call_payload(output)
                 if parsed_call is not None:
                     calls.append(parsed_call)
     return calls
+
+
+def parse_envoi_call_payload(value: Any) -> EnvoiCall | None:
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        return parse_envoi_call_payload(parsed)
+
+    if isinstance(value, dict):
+        if "path" in value and "timestamp" in value:
+            try:
+                return EnvoiCall(**value)
+            except Exception:
+                pass
+        for nested_key in ("result", "data", "output", "structured_content"):
+            if nested_key in value:
+                parsed_nested = parse_envoi_call_payload(value.get(nested_key))
+                if parsed_nested is not None:
+                    return parsed_nested
+    return None
 
 
 def count_meaningful_parts(messages: list[dict[str, Any]]) -> int:
@@ -2324,12 +2325,8 @@ async def _run_trajectory_impl(
                                 if isinstance(payload.get("error"), str)
                                 else None
                             )
-                            if evaluation.error:
-                                evaluation.stdout = raw_stdout
-                                evaluation.stderr = raw_stderr
-                            else:
-                                evaluation.stdout = None
-                                evaluation.stderr = None
+                            evaluation.stdout = raw_stdout
+                            evaluation.stderr = raw_stderr
                             evaluation.duration_ms = int(
                                 payload.get("duration_ms", 0) or 0
                             )
@@ -2541,37 +2538,6 @@ async def _run_trajectory_impl(
 
                 new_parts = part_count - previous_part_count
                 if turn_record is not None:
-                    target_parts = min(max(observed_parts, streamed_parts), remaining_parts)
-                    missing_stream_parts = max(0, target_parts - new_parts)
-                    while missing_stream_parts > 0 and part_count < effective_max_parts:
-                        part_count += 1
-                        absolute_part = part_count
-                        placeholder = PartRecord(
-                            trajectory_id=trajectory_id,
-                            session_id=session_id,
-                            agent=agent,
-                            part=absolute_part,
-                            timestamp=datetime.now(UTC).isoformat(),
-                            role="assistant",
-                            part_type=None,
-                            item_type=None,
-                            summary="placeholder",
-                            duration_ms=None,
-                            agent_model=resolved_model,
-                            git_commit=git_commit,
-                            envoi_calls=[],
-                            testing_state=tracker.snapshot(),
-                            repo_checkpoint=None,
-                        )
-                        turn_record.parts.append(placeholder)
-                        agent_trace.parts.append(placeholder)
-                        if turn_record.part_start is None:
-                            turn_record.part_start = absolute_part
-                        turn_record.part_end = absolute_part
-                        save_agent_trace_snapshot(trajectory_id, agent_trace)
-                        missing_stream_parts -= 1
-                    new_parts = part_count - previous_part_count
-
                     turn_record.session_id = session_id
                     for record in turn_record.parts:
                         record.session_id = session_id
@@ -2591,6 +2557,10 @@ async def _run_trajectory_impl(
                     else:
                         turn_record.git_commit = git_commit
                 save_agent_trace_snapshot(trajectory_id, agent_trace)
+
+                if evaluation_tasks:
+                    print("[eval] waiting for pending commit evaluations before next turn")
+                    await _wait_for_evaluations()
 
                 solved_count = len(tracker.solved)
                 total_count = len(tracker.required_paths)
