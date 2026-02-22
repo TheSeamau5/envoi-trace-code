@@ -5,9 +5,8 @@ Runs an agent backend with a part budget and saves a trace.parquet artifact
 containing per-part records, git checkpoints, and parsed envoi test calls.
 
 Usage:
-    modal run runner.py --agent opencode --max-parts 1000 --model opencode/gpt-5-nano
-    modal run runner.py --agent codex --max-parts 1000
-    modal run runner.py --agent codex --max-parts 1000 --codex-auth-file /path/to/auth.json
+    envoi-trace --task examples/tasks/c_compiler --env examples/environments/c_compiler
+    envoi-trace --agent codex --max-parts 1000 --task <path> --env <path>
 """
 
 from __future__ import annotations
@@ -108,28 +107,30 @@ OPENCODE_CLIENT = (Path(__file__).parent / "agents" / "opencode.py").read_text()
 CODEX_CLIENT = (Path(__file__).parent / "agents" / "codex.py").read_text()
 OPENCODE_CONFIG = OPENCODE_CONFIG_TEMPLATE
 
-_DEFAULT_TASK = os.environ.get("ENVOI_TASK", "c_compiler")
+_EXAMPLES_DIR = Path(__file__).parent / "examples"
+_DEFAULT_ENVIRONMENT_DIR = _EXAMPLES_DIR / "environments" / "c_compiler"
 
 
 async def load_task(
-    task_name: str, *, lang: str = "en",
+    task_dir: Path, *, lang: str = "en",
 ) -> tuple[str, dict[str, Any]]:
     """Load a task prompt by convention.
 
-    Tier 3: tasks/<name>/task.py with generate()
+    Tier 3: task_dir/task.py with generate()
     Tier 2: prompt file + params.py
     Tier 1: prompt file only
     """
-    import importlib
-
-    task_dir = Path(__file__).parent / "tasks" / task_name
+    import importlib.util
 
     # Tier 3: full dynamic generation
     if (task_dir / "task.py").exists():
-        mod = importlib.import_module(f"tasks.{task_name}.task")
-        gen = getattr(mod, "generate", None)
-        if gen is not None:
-            return await gen() if asyncio.iscoroutinefunction(gen) else gen()
+        spec = importlib.util.spec_from_file_location("_task", task_dir / "task.py")
+        if spec and spec.loader:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            gen = getattr(mod, "generate", None)
+            if gen is not None:
+                return await gen() if asyncio.iscoroutinefunction(gen) else gen()
 
     # Tier 1/2: load prompt file
     prompt_file = task_dir / f"{lang}.md"
@@ -143,21 +144,19 @@ async def load_task(
     # Tier 2: apply params if params.py exists
     params: dict[str, Any] = {}
     if (task_dir / "params.py").exists():
-        params_mod = importlib.import_module(f"tasks.{task_name}.params")
-        params_fn = params_mod.params
-        params = (
-            await params_fn()
-            if asyncio.iscoroutinefunction(params_fn)
-            else params_fn()
-        )
-        prompt = prompt.format(**params)
+        spec = importlib.util.spec_from_file_location("_params", task_dir / "params.py")
+        if spec and spec.loader:
+            params_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(params_mod)
+            params_fn = params_mod.params
+            params = (
+                await params_fn()
+                if asyncio.iscoroutinefunction(params_fn)
+                else params_fn()
+            )
+            prompt = prompt.format(**params)
 
     return prompt, params
-
-
-_DEFAULT_ENVIRONMENT_DIR = (
-    Path(__file__).parent / "environments" / _DEFAULT_TASK
-)
 _ENV_PY, _ENV_C, _ENV_TXT = load_environment_files(
     _DEFAULT_ENVIRONMENT_DIR,
 )
@@ -203,12 +202,12 @@ function_image = (
         Path(__file__).parent / "models.py",
         remote_path="/root/models.py",
     )
-    .add_local_dir(Path(__file__).parent / "tasks", remote_path="/root/tasks")
+    .add_local_dir(_EXAMPLES_DIR / "tasks", remote_path="/root/examples/tasks")
     .add_local_dir(Path(__file__).parent / "agents", remote_path="/root/agents")
     .add_local_dir(Path(__file__).parent / "sandbox", remote_path="/root/sandbox")
     .add_local_dir(
-        Path(__file__).parent / "environments",
-        remote_path="/root/environments",
+        _EXAMPLES_DIR / "environments",
+        remote_path="/root/examples/environments",
     )
 )
 
@@ -577,7 +576,8 @@ async def _run_trajectory_impl(
     codex_auth_json_b64: str | None = None,
     resume: bool = RESUME_FROM_S3,
     sandbox_provider: str = "modal",
-    task: str = _DEFAULT_TASK,
+    task_dir: str = "",
+    environment_dir: str = "",
     task_lang: str = "en",
     task_params: dict[str, str] | None = None,
 ) -> str:
@@ -585,13 +585,14 @@ async def _run_trajectory_impl(
         trajectory_id = str(uuid.uuid4())
     agent = (agent or DEFAULT_AGENT).strip().lower()
 
-    environment = task  # environment name = task name by convention
-    environment_dir = Path(__file__).parent / "environments" / environment
-    prompt, task_params_loaded = await load_task(task, lang=task_lang)
+    task_path = Path(task_dir)
+    env_path = Path(environment_dir)
+    environment = env_path.name
+    prompt, task_params_loaded = await load_task(task_path, lang=task_lang)
     if task_params:
         task_params_loaded.update(task_params)
-    env_files = load_environment_files(environment_dir)
-    setup_script_file = environment_dir / "setup.sh"
+    env_files = load_environment_files(env_path)
+    setup_script_file = env_path / "setup.sh"
     setup_script = (
         setup_script_file.read_text() if setup_script_file.exists() else ""
     )
@@ -772,10 +773,10 @@ async def _run_trajectory_impl(
                 queued_at=queued_at,
             )
             save_trace_parquet(
-            trajectory_id, agent_trace,
-            environment=environment,
-            task_params=task_params_loaded,
-        )
+                trajectory_id, agent_trace,
+                environment=environment,
+                task_params=task_params_loaded,
+            )
 
             async def _runner() -> None:
                 started_at = datetime.now(UTC).isoformat()
@@ -791,10 +792,10 @@ async def _run_trajectory_impl(
                 evaluation.status = "running"
                 evaluation.started_at = started_at
                 save_trace_parquet(
-            trajectory_id, agent_trace,
-            environment=environment,
-            task_params=task_params_loaded,
-        )
+                    trajectory_id, agent_trace,
+                    environment=environment,
+                    task_params=task_params_loaded,
+                )
 
                 async with evaluation_semaphore:
                     run_payload: dict[str, Any] | None = None
@@ -898,10 +899,10 @@ async def _run_trajectory_impl(
                             f"passed={evaluation.passed}/{evaluation.total}"
                         )
                         save_trace_parquet(
-            trajectory_id, agent_trace,
-            environment=environment,
-            task_params=task_params_loaded,
-        )
+                            trajectory_id, agent_trace,
+                            environment=environment,
+                            task_params=task_params_loaded,
+                        )
 
             task = asyncio.create_task(_runner())
             evaluation_tasks.add(task)
@@ -1079,10 +1080,10 @@ async def _run_trajectory_impl(
                             session_id = recovered_session_id
                             agent_trace.session_id = recovered_session_id
                             save_trace_parquet(
-            trajectory_id, agent_trace,
-            environment=environment,
-            task_params=task_params_loaded,
-        )
+                                trajectory_id, agent_trace,
+                                environment=environment,
+                                task_params=task_params_loaded,
+                            )
                             prompt_text = _followup()
                             continue
                     end_reason = "agent_error"
@@ -1229,10 +1230,10 @@ async def _run_trajectory_impl(
                     )
                     agent_trace.turns.append(crash_record)
                     save_trace_parquet(
-            trajectory_id, agent_trace,
-            environment=environment,
-            task_params=task_params_loaded,
-        )
+                        trajectory_id, agent_trace,
+                        environment=environment,
+                        task_params=task_params_loaded,
+                    )
                     print(f"[error] saved {len(crash_new_messages)} new messages before crash")
             except Exception:
                 print("[error] could not save crash messages")
@@ -1294,7 +1295,8 @@ async def run_trajectory(
     codex_auth_json_b64: str | None = None,
     resume: bool = RESUME_FROM_S3,
     sandbox_provider: str = "modal",
-    task: str = _DEFAULT_TASK,
+    task_dir: str = "",
+    environment_dir: str = "",
 ) -> str:
     return await _run_trajectory_impl(
         agent=agent,
@@ -1306,7 +1308,8 @@ async def run_trajectory(
         codex_auth_json_b64=codex_auth_json_b64,
         resume=resume,
         sandbox_provider=sandbox_provider,
-        task=task,
+        task_dir=task_dir,
+        environment_dir=environment_dir,
     )
 
 
@@ -1327,7 +1330,8 @@ async def run_trajectory_non_preemptible(
     codex_auth_json_b64: str | None = None,
     resume: bool = RESUME_FROM_S3,
     sandbox_provider: str = "modal",
-    task: str = _DEFAULT_TASK,
+    task_dir: str = "",
+    environment_dir: str = "",
 ) -> str:
     return await _run_trajectory_impl(
         agent=agent,
@@ -1339,7 +1343,8 @@ async def run_trajectory_non_preemptible(
         codex_auth_json_b64=codex_auth_json_b64,
         resume=resume,
         sandbox_provider=sandbox_provider,
-        task=task,
+        task_dir=task_dir,
+        environment_dir=environment_dir,
     )
 
 
@@ -1363,7 +1368,8 @@ async def main(
     codex_auth_file: str = "~/.codex/auth.json",
     resume: bool = RESUME_FROM_S3,
     sandbox_provider: str = "modal",
-    task: str = _DEFAULT_TASK,
+    task_dir: str = "",
+    environment_dir: str = "",
 ) -> None:
     normalized_agent = (agent or DEFAULT_AGENT).strip().lower()
     codex_auth_json_b64: str | None = None
@@ -1385,7 +1391,8 @@ async def main(
             codex_auth_json_b64=codex_auth_json_b64,
             resume=resume,
             sandbox_provider=sandbox_provider,
-            task=task,
+            task_dir=task_dir,
+            environment_dir=environment_dir,
         )
         print(f"Completed trajectory: {result}")
     except Exception as e:
@@ -1417,7 +1424,8 @@ if __name__ == "__main__":
         "--message-timeout-seconds", type=int, default=MESSAGE_TIMEOUT_SECONDS
     )
     _parser.add_argument("--codex-auth-file", default="~/.codex/auth.json")
-    _parser.add_argument("--task", default=_DEFAULT_TASK)
+    _parser.add_argument("--task-dir", required=True)
+    _parser.add_argument("--environment-dir", required=True)
     _args = _parser.parse_args()
 
     _codex_auth_json_b64: str | None = None
@@ -1433,6 +1441,7 @@ if __name__ == "__main__":
             trajectory_id=_args.trajectory_id,
             codex_auth_json_b64=_codex_auth_json_b64,
             sandbox_provider=_args.sandbox_provider,
-            task=_args.task,
+            task_dir=_args.task_dir,
+            environment_dir=_args.environment_dir,
         )
     )
