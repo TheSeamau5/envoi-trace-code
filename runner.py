@@ -25,13 +25,23 @@ import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
 
 import boto3
 import modal
-from pydantic import BaseModel, Field
 
 from agents.opencode import OPENCODE_CONFIG_TEMPLATE
+from models import (
+    AgentTrace,
+    AgentTurnOutcome,
+    EnvoiCall,
+    EvaluationRecord,
+    PartRecord,
+    RepoCheckpoint,
+    SessionEnd,
+    TestingState,
+    TurnRecord,
+)
 from sandbox.base import SandboxBackend
 from sandbox.modal import ModalSandbox
 from tasks.resolver import EnvConfig, resolve_task
@@ -42,8 +52,8 @@ app = modal.App("envoi-trace")
 DEFAULT_OPENCODE_MODEL = "opencode/gpt-5-nano"
 DEFAULT_CODEX_MODEL = "gpt-5.3-codex"
 DEFAULT_AGENT = "codex"
-DEFAULT_MODEL = DEFAULT_CODEX_MODEL
 CODEX_HOME_DIR = "/tmp/codex-home"
+TRACE_EVENT_PREFIX = "TRACE_EVENT "
 MESSAGE_TIMEOUT_SECONDS = int(
     os.environ.get("MESSAGE_TIMEOUT_SECONDS", "600")
 )  # hard cap per message turn
@@ -53,7 +63,6 @@ MIN_TURN_TIMEOUT_SECONDS = int(
 SECONDS_PER_REMAINING_PART = int(
     os.environ.get("SECONDS_PER_REMAINING_PART", "60")
 )  # adaptive cap as part budget gets tight
-TRACE_EVENT_PREFIX = "TRACE_EVENT "
 SETUP_UPLOAD_CONCURRENCY = max(1, int(os.environ.get("SETUP_UPLOAD_CONCURRENCY", "8")))
 EVALUATION_CONCURRENCY = max(1, int(os.environ.get("EVALUATION_CONCURRENCY", "1")))
 EVALUATION_TIMEOUT_SECONDS = max(60, int(os.environ.get("EVALUATION_TIMEOUT_SECONDS", "7200")))
@@ -300,201 +309,6 @@ def compute_turn_timeout_seconds(
     )
     timeout_from_run_budget = max(1, int(remaining_run_seconds))
     return max(1, min(message_timeout_seconds, timeout_from_parts, timeout_from_run_budget))
-
-
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
-
-
-class TestResult(BaseModel):
-    passed: int
-    failed: int
-    total: int
-    tests: list[dict[str, Any]] = Field(default_factory=list)
-
-
-class EnvoiCall(BaseModel):
-    path: str
-    timestamp: str
-    duration_ms: int
-    status_code: int
-    error: str | None = None
-    result: TestResult | None = None
-
-
-class TestingState(BaseModel):
-    solved_paths: int
-    total_paths: int
-    latest_path: str | None = None
-    latest_passed: int | None = None
-    latest_total: int | None = None
-    latest_status_code: int | None = None
-    latest_error: str | None = None
-
-
-class SessionEnd(BaseModel):
-    reason: Literal["solved", "part_limit", "timeout", "agent_error", "envoi_error"]
-    total_parts: int
-    total_turns: int | None = None
-    final_git_commit: str | None = None
-
-
-class RepoCheckpoint(BaseModel):
-    commit_before: str | None = None
-    commit_after: str | None = None
-    committed: bool = False
-    changed_files: list[str] = Field(default_factory=list)
-    patch: str | None = None
-    stats: str | None = None
-    numstat: list[dict[str, Any]] = Field(default_factory=list)
-
-
-class EvaluationRecord(BaseModel):
-    commit: str
-    part: int
-    status: Literal["queued", "running", "completed", "failed"] = "queued"
-    queued_at: str
-    started_at: str | None = None
-    completed_at: str | None = None
-    duration_ms: int | None = None
-    passed: int = 0
-    failed: int = 0
-    total: int = 0
-    suite_results: dict[str, Any] = Field(default_factory=dict)
-    error: str | None = None
-    command: str | None = None
-    exit_code: int | None = None
-    stdout: str | None = None
-    stderr: str | None = None
-
-
-class PartRecord(BaseModel):
-    trajectory_id: str
-    session_id: str
-    agent: str = DEFAULT_AGENT
-    part: int | None = None
-    timestamp: str
-    role: Literal["assistant", "user"] = "assistant"
-    part_type: str | None = None
-    item_type: str | None = None
-    summary: str | None = None
-    duration_ms: int | None = None
-    agent_model: str
-    git_commit: str | None = None
-    files: list[str] = Field(default_factory=list)
-    content: str | None = None
-    summary_word_count: int | None = None
-    summary_token_estimate: int | None = None
-    content_word_count: int | None = None
-    content_token_estimate: int | None = None
-    tool_name: str | None = None
-    tool_status: str | None = None
-    tool_input: Any = None
-    tool_output: Any = None
-    tool_error: Any = None
-    tool_exit_code: int | None = None
-    token_usage: dict[str, Any] | None = None
-    provider_part: dict[str, Any] | None = None
-    provider_item: dict[str, Any] | None = None
-    provider_event: dict[str, Any] | None = None
-    patch: str | None = None
-    envoi_calls: list[EnvoiCall] = Field(default_factory=list)
-    testing_state: TestingState | None = None
-    repo_checkpoint: RepoCheckpoint | None = None
-
-
-class TurnRecord(BaseModel):
-    trajectory_id: str
-    session_id: str
-    agent: str = DEFAULT_AGENT
-    turn: int
-    part_start: int | None = None
-    part_end: int | None = None
-    timestamp: str
-    agent_model: str
-    prompt: str | None = None
-    git_commit: str | None = None
-    repo_checkpoint: RepoCheckpoint | None = None
-    session_ids: list[str] = Field(default_factory=list)
-    session_objects: list[dict[str, Any]] = Field(default_factory=list)
-    new_messages: list[dict[str, Any]] = Field(default_factory=list)
-    token_usage: dict[str, Any] | None = None
-    parts: list[PartRecord] = Field(default_factory=list)
-    session_end: SessionEnd | None = None
-
-
-class AgentTrace(BaseModel):
-    trajectory_id: str
-    session_id: str
-    agent: str = DEFAULT_AGENT
-    agent_model: str
-    started_at: str
-    parts: list[PartRecord] = Field(default_factory=list)
-    turns: list[TurnRecord] = Field(default_factory=list)
-    evaluations: dict[str, EvaluationRecord] = Field(default_factory=dict)
-    artifacts: dict[str, str | None] = Field(default_factory=dict)
-    session_end: SessionEnd | None = None
-
-
-class AgentTurnOutcome(BaseModel):
-    session_id: str
-    response: dict[str, Any]
-    session_objects: list[dict[str, Any]] = Field(default_factory=list)
-    session_ids: list[str] = Field(default_factory=list)
-    new_messages: list[dict[str, Any]] = Field(default_factory=list)
-
-
-class AgentBackend(Protocol):
-    name: str
-
-    def resolve_model(self, model: str | None) -> str:
-        ...
-
-    async def setup_sandbox(
-        self,
-        sb: SandboxBackend,
-        model: str,
-        api_key: str,
-        auth_json: str | None = None,
-        env_config: EnvConfig | None = None,
-        env_files: tuple[
-            dict[str, str], dict[str, str], dict[str, str]
-        ] | None = None,
-    ) -> None:
-        ...
-
-    async def create_session(self, sb: SandboxBackend, trajectory_id: str) -> str | None:
-        ...
-
-    async def ensure_authenticated(
-        self,
-        sb: SandboxBackend,
-        api_key: str,
-        auth_json: str | None = None,
-    ) -> None:
-        ...
-
-    async def run_turn(
-        self,
-        sb: SandboxBackend,
-        session_id: str,
-        model: str,
-        prompt_text: str,
-        seen_message_ids: set[str],
-        timeout: int,
-        remaining_parts_budget: int,
-        on_stream_part: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-    ) -> AgentTurnOutcome | None:
-        ...
-
-    async def collect_crash_messages(
-        self,
-        sb: SandboxBackend,
-        session_id: str,
-        seen_message_ids: set[str],
-    ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
-        ...
 
 
 # ---------------------------------------------------------------------------
@@ -817,6 +631,10 @@ function_image = (
         Path(__file__).parent / "trace_format.py",
         remote_path="/root/trace_format.py",
     )
+    .add_local_file(
+        Path(__file__).parent / "models.py",
+        remote_path="/root/models.py",
+    )
     .add_local_dir(Path(__file__).parent / "tasks", remote_path="/root/tasks")
     .add_local_dir(Path(__file__).parent / "agents", remote_path="/root/agents")
     .add_local_dir(Path(__file__).parent / "sandbox", remote_path="/root/sandbox")
@@ -935,316 +753,6 @@ async def upload_files_parallel(
             )
 
     await asyncio.gather(*[_upload(path, content) for path, content in uploads])
-
-
-# ---------------------------------------------------------------------------
-# OpenCode API helpers — Python SDK wrapper
-# ---------------------------------------------------------------------------
-
-
-async def run_opencode_client(
-    sb: SandboxBackend,
-    args: list[str],
-    *,
-    timeout: int = 60,
-    quiet: bool = False,
-    stream_output: bool = False,
-    on_stderr_line: Callable[[str], Awaitable[None]] | None = None,
-) -> dict[str, Any] | None:
-    command = "python3 /sandbox/opencode_client.py " + " ".join(shlex.quote(a) for a in args)
-    exit_code, stdout, stderr = (await sb.run(
-        command,
-        timeout=timeout,
-        quiet=quiet,
-        stream_output=stream_output,
-        on_stderr_line=on_stderr_line,
-    )).unpack()
-    if exit_code != 0:
-        if stderr:
-            print(f"[opencode-sdk] command failed: {stderr[:500]}")
-        return None
-
-    try:
-        return json.loads(stdout)
-    except json.JSONDecodeError:
-        print(f"[opencode-sdk] invalid JSON response: {truncate_text(stdout, limit=500)}")
-        return None
-
-
-async def run_codex_client(
-    sb: SandboxBackend,
-    args: list[str],
-    *,
-    timeout: int = 60,
-    quiet: bool = False,
-    stream_output: bool = False,
-    on_stderr_line: Callable[[str], Awaitable[None]] | None = None,
-) -> dict[str, Any] | None:
-    command = "python3 -u /sandbox/codex_client.py " + " ".join(shlex.quote(a) for a in args)
-    exit_code, stdout, stderr = (await sb.run(
-        command,
-        timeout=timeout,
-        quiet=quiet,
-        stream_output=stream_output,
-        on_stderr_line=on_stderr_line,
-    )).unpack()
-    if exit_code != 0:
-        if stderr:
-            print(f"[codex-cli] command failed: {stderr[:500]}")
-        return None
-    try:
-        return json.loads(stdout)
-    except json.JSONDecodeError:
-        print(f"[codex-cli] invalid JSON response: {truncate_text(stdout, limit=500)}")
-        return None
-
-
-async def create_session(sb: SandboxBackend, title: str) -> str | None:
-    response = await run_opencode_client(
-        sb,
-        ["create-session", "--title", title],
-        timeout=60,
-    )
-    if response is None:
-        return None
-
-    if not response.get("ok"):
-        print(f"[session] create failed: {response.get('error')}")
-        return None
-
-    body = response.get("body", {})
-    session_id = body.get("id") if isinstance(body, dict) else None
-    print(f"[session] created id={session_id}")
-    return session_id
-
-
-async def send_message_blocking(
-    sb: SandboxBackend,
-    session_id: str,
-    text: str,
-    timeout: int = MESSAGE_TIMEOUT_SECONDS,
-    remaining_parts_budget: int = 0,
-    on_stream_part: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-) -> dict[str, Any] | None:
-    prompt_path = "/tmp/prompt.txt"
-    await sb.write_file(prompt_path, text, ensure_dir=False)
-    print(f"[prompt] sending message ({len(text)} chars), waiting up to {timeout}s...")
-
-    async def handle_stderr_line(line: str) -> None:
-        if on_stream_part is None:
-            return
-        stripped = line.strip()
-        if not stripped.startswith(TRACE_EVENT_PREFIX):
-            return
-        payload = stripped[len(TRACE_EVENT_PREFIX):].strip()
-        if not payload:
-            return
-        try:
-            event_obj = json.loads(payload)
-        except json.JSONDecodeError:
-            return
-        if isinstance(event_obj, dict):
-            await on_stream_part(event_obj)
-
-    response = await run_opencode_client(
-        sb,
-        [
-            "chat-stream",
-            "--session-id",
-            session_id,
-            "--text-file",
-            prompt_path,
-            "--max-parts",
-            str(remaining_parts_budget),
-        ],
-        timeout=timeout,
-        stream_output=True,
-        on_stderr_line=handle_stderr_line,
-    )
-    if response is None:
-        return None
-
-    status_code = response.get("status_code")
-    ok = bool(response.get("ok"))
-    body = response.get("body")
-    meta = response.get("meta")
-    meta_obj = meta if isinstance(meta, dict) else {}
-    aborted_for_part_limit = bool(meta_obj.get("aborted_for_part_limit"))
-    print(f"[prompt] done http={status_code} ok={ok}")
-
-    if not ok:
-        if aborted_for_part_limit:
-            print("[prompt] part limit reached during stream; ending current turn")
-            if isinstance(body, dict):
-                stream_meta = body.get("_stream")
-                stream_obj = stream_meta if isinstance(stream_meta, dict) else {}
-                stream_obj.update(meta_obj)
-                body["_stream"] = stream_obj
-                return body
-            return {"_stream": dict(meta_obj)}
-        print(f"[prompt] ERROR: {truncate_text(str(response.get('error') or body), limit=1000)}")
-        return None
-
-    if not isinstance(body, dict):
-        if aborted_for_part_limit:
-            return {"_stream": dict(meta_obj)}
-        print(f"[prompt] unexpected response type: {type(body).__name__}")
-        return None
-
-    stream_meta = body.get("_stream")
-    stream_obj = stream_meta if isinstance(stream_meta, dict) else {}
-    stream_obj.update(meta_obj)
-    body["_stream"] = stream_obj
-
-    return body
-
-
-async def get_all_messages(sb: SandboxBackend, session_id: str) -> list[dict[str, Any]]:
-    response = await run_opencode_client(
-        sb,
-        ["list-messages", "--session-id", session_id],
-        timeout=60,
-        quiet=True,
-    )
-    if response is None or not response.get("ok"):
-        return []
-    body = response.get("body")
-    if isinstance(body, list):
-        return body
-    if isinstance(body, dict):
-        for key in ("items", "messages", "data", "results"):
-            value = body.get(key)
-            if isinstance(value, list):
-                return value
-    return []
-
-
-async def get_all_sessions(sb: SandboxBackend) -> list[dict[str, Any]]:
-    response = await run_opencode_client(
-        sb,
-        ["list-sessions"],
-        timeout=60,
-        quiet=True,
-    )
-    if response is None or not response.get("ok"):
-        return []
-    body = response.get("body")
-    if isinstance(body, list):
-        return body
-    if isinstance(body, dict):
-        for key in ("items", "sessions", "data", "results"):
-            value = body.get(key)
-            if isinstance(value, list):
-                return value
-    return []
-
-
-def session_object_id(session: dict[str, Any]) -> str | None:
-    for key in ("id", "sessionID", "session_id"):
-        value = session.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
-
-
-def session_object_parent_id(session: dict[str, Any]) -> str | None:
-    for key in ("parentID", "parent_id", "parentId"):
-        value = session.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
-
-
-def get_session_family(root_session_id: str, sessions: list[dict[str, Any]]) -> list[str]:
-    known_ids = {
-        session_id
-        for session in sessions
-        if isinstance(session, dict)
-        if (session_id := session_object_id(session))
-    }
-    if root_session_id not in known_ids:
-        return [root_session_id]
-
-    children_by_parent: dict[str, list[str]] = {}
-    for session in sessions:
-        if not isinstance(session, dict):
-            continue
-        session_id = session_object_id(session)
-        parent_id = session_object_parent_id(session)
-        if session_id and parent_id:
-            children_by_parent.setdefault(parent_id, []).append(session_id)
-
-    family: list[str] = []
-    queue = [root_session_id]
-    seen: set[str] = set()
-    while queue:
-        current = queue.pop(0)
-        if current in seen:
-            continue
-        seen.add(current)
-        family.append(current)
-        queue.extend(children_by_parent.get(current, []))
-    return family
-
-
-def message_created_ms(message: dict[str, Any]) -> int:
-    info = message.get("info", {})
-    time_info = info.get("time", {})
-    created = time_info.get("created")
-    return int(created) if isinstance(created, int) else 0
-
-
-def message_id(message: dict[str, Any]) -> str | None:
-    info = message.get("info", {})
-    message_id_value = info.get("id")
-    if isinstance(message_id_value, str) and message_id_value:
-        return message_id_value
-    return None
-
-
-async def collect_turn_messages(
-    sb: SandboxBackend,
-    root_session_id: str,
-    seen_message_ids: set[str],
-) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
-    sessions = await get_all_sessions(sb)
-    session_ids = get_session_family(root_session_id, sessions)
-    session_map: dict[str, dict[str, Any]] = {}
-    for session in sessions:
-        if not isinstance(session, dict):
-            continue
-        sid = session_object_id(session)
-        if sid and sid in session_ids:
-            session_map[sid] = session
-
-    message_results = await asyncio.gather(
-        *[get_all_messages(sb, session_id) for session_id in session_ids]
-    )
-
-    all_messages: list[dict[str, Any]] = []
-    for session_id, messages in zip(session_ids, message_results, strict=False):
-        for message in messages:
-            if not isinstance(message, dict):
-                continue
-            info = message.setdefault("info", {})
-            if "sessionID" not in info:
-                info["sessionID"] = session_id
-            all_messages.append(message)
-
-    all_messages.sort(key=message_created_ms)
-
-    new_messages: list[dict[str, Any]] = []
-    for message in all_messages:
-        mid = message_id(message)
-        if mid and mid in seen_message_ids:
-            continue
-        if mid:
-            seen_message_ids.add(mid)
-        new_messages.append(message)
-
-    session_objects = [session_map[sid] for sid in session_ids if sid in session_map]
-
-    return session_objects, session_ids, new_messages
 
 
 async def run_git_command_with_retry(
@@ -1669,31 +1177,6 @@ async def run_commit_evaluation(
     }
 
 
-async def ensure_provider_connected(sb: SandboxBackend, api_key: str) -> None:
-    response = await run_opencode_client(
-        sb,
-        ["provider-status"],
-        timeout=30,
-        quiet=True,
-    )
-    if response and response.get("ok") and isinstance(response.get("body"), dict):
-        connected = response["body"].get("connected", [])
-        print(f"[provider] connected={connected}")
-        if isinstance(connected, list) and "opencode" in connected:
-            return
-
-    print("[provider] opencode not connected, setting auth...")
-    api_key_path = "/tmp/auth_opencode_api_key.txt"
-    await sb.write_file(api_key_path, api_key, ensure_dir=False)
-    auth_response = await run_opencode_client(
-        sb,
-        ["provider-auth", "--api-key-file", api_key_path],
-        timeout=30,
-    )
-    if auth_response is None or not auth_response.get("ok"):
-        raise RuntimeError(f"Failed to authenticate provider: {auth_response}")
-
-
 # ---------------------------------------------------------------------------
 # Agent backends + sb setup
 # ---------------------------------------------------------------------------
@@ -1918,238 +1401,516 @@ async def setup_sandbox_codex(
     await run_setup_script(sb, "codex")
 
 
-class OpenCodeBackend:
-    name = "opencode"
-
-    def resolve_model(self, model: str | None) -> str:
-        return resolve_model(self.name, model)
-
-    async def setup_sandbox(
-        self,
-        sb: SandboxBackend,
-        model: str,
-        api_key: str,
-        auth_json: str | None = None,
-        env_config: EnvConfig | None = None,
-        env_files: tuple[
-            dict[str, str], dict[str, str], dict[str, str]
-        ] | None = None,
-    ) -> None:
-        script = env_config.setup_script if env_config else ""
-        await setup_sandbox_opencode(
-            sb, model, api_key,
-            setup_script=script, env_files=env_files,
-        )
-
-    async def create_session(self, sb: SandboxBackend, trajectory_id: str) -> str | None:
-        return await create_session(sb, title=f"trajectory-{trajectory_id}")
-
-    async def ensure_authenticated(
-        self,
-        sb: SandboxBackend,
-        api_key: str,
-        auth_json: str | None = None,
-    ) -> None:
-        await ensure_provider_connected(sb, api_key)
-
-    async def run_turn(
-        self,
-        sb: SandboxBackend,
-        session_id: str,
-        model: str,
-        prompt_text: str,
-        seen_message_ids: set[str],
-        timeout: int,
-        remaining_parts_budget: int,
-        on_stream_part: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-    ) -> AgentTurnOutcome | None:
-        response = await send_message_blocking(
-            sb,
-            session_id,
-            prompt_text,
-            timeout=timeout,
-            remaining_parts_budget=remaining_parts_budget,
-            on_stream_part=on_stream_part,
-        )
-        if response is None:
-            return None
-        session_objects, session_ids, new_messages = await collect_turn_messages(
-            sb,
-            session_id,
-            seen_message_ids,
-        )
-        return AgentTurnOutcome(
-            session_id=session_id,
-            response=response,
-            session_objects=session_objects,
-            session_ids=session_ids,
-            new_messages=new_messages,
-        )
-
-    async def collect_crash_messages(
-        self,
-        sb: SandboxBackend,
-        session_id: str,
-        seen_message_ids: set[str],
-    ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
-        return await collect_turn_messages(sb, session_id, seen_message_ids)
+# ---------------------------------------------------------------------------
+# Sandbox client helpers (shared between opencode + codex)
+# ---------------------------------------------------------------------------
 
 
-class CodexBackend:
-    name = "codex"
-
-    def __init__(self) -> None:
-        self._api_key_file: str | None = None
-
-    def resolve_model(self, model: str | None) -> str:
-        return resolve_model(self.name, model)
-
-    async def setup_sandbox(
-        self,
-        sb: SandboxBackend,
-        model: str,
-        api_key: str,
-        auth_json: str | None = None,
-        env_config: EnvConfig | None = None,
-        env_files: tuple[
-            dict[str, str], dict[str, str], dict[str, str]
-        ] | None = None,
-    ) -> None:
-        self._api_key_file = (
-            "/tmp/upload/codex_api_key.txt" if api_key else None
-        )
-        script = env_config.setup_script if env_config else ""
-        await setup_sandbox_codex(
-            sb, model, api_key, auth_json,
-            setup_script=script, env_files=env_files,
-        )
-
-    async def create_session(self, sb: SandboxBackend, trajectory_id: str) -> str | None:
-        return f"pending-{trajectory_id}"
-
-    async def ensure_authenticated(
-        self,
-        sb: SandboxBackend,
-        api_key: str,
-        auth_json: str | None = None,
-    ) -> None:
+async def run_sandbox_client(
+    sb: SandboxBackend,
+    script_path: str,
+    label: str,
+    args: list[str],
+    *,
+    timeout: int = 60,
+    quiet: bool = False,
+    stream_output: bool = False,
+    on_stderr_line: Callable[[str], Awaitable[None]] | None = None,
+) -> dict[str, Any] | None:
+    """Run a sandbox client script and return parsed JSON stdout."""
+    command = (
+        f"python3 -u {shlex.quote(script_path)} "
+        + " ".join(shlex.quote(a) for a in args)
+    )
+    exit_code, stdout, stderr = (await sb.run(
+        command,
+        timeout=timeout,
+        quiet=quiet,
+        stream_output=stream_output,
+        on_stderr_line=on_stderr_line,
+    )).unpack()
+    if exit_code != 0:
+        if stderr:
+            builtins.print(
+                f"[{label}] command failed: {stderr[:500]}", flush=True,
+            )
         return None
 
-    async def run_turn(
-        self,
-        sb: SandboxBackend,
-        session_id: str,
-        model: str,
-        prompt_text: str,
-        seen_message_ids: set[str],
-        timeout: int,
-        remaining_parts_budget: int,
-        on_stream_part: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-    ) -> AgentTurnOutcome | None:
-        prompt_path = "/tmp/prompt.txt"
-        await sb.write_file(prompt_path, prompt_text, ensure_dir=False)
-        args = [
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        stdout_preview = stdout[:500] + "...[truncated]" if len(stdout) > 500 else stdout
+        builtins.print(
+            f"[{label}] invalid JSON response: {stdout_preview}",
+            flush=True,
+        )
+        return None
+
+
+async def parse_trace_event_line(
+    line: str,
+    on_stream_part: Callable[[dict[str, Any]], Awaitable[None]] | None,
+) -> None:
+    """Parse a TRACE_EVENT from a stderr line and forward to callback."""
+    if on_stream_part is None:
+        return
+    stripped = line.strip()
+    if not stripped.startswith(TRACE_EVENT_PREFIX):
+        return
+    payload = stripped[len(TRACE_EVENT_PREFIX):].strip()
+    if not payload:
+        return
+    try:
+        event_obj = json.loads(payload)
+    except json.JSONDecodeError:
+        return
+    if isinstance(event_obj, dict):
+        await on_stream_part(event_obj)
+
+
+def agent_message_id(message: dict[str, Any]) -> str | None:
+    """Extract the message id from a message dict."""
+    info = message.get("info", {})
+    message_id_value = info.get("id")
+    if isinstance(message_id_value, str) and message_id_value:
+        return message_id_value
+    return None
+
+
+# ---------------------------------------------------------------------------
+# OpenCode agent functions
+# ---------------------------------------------------------------------------
+
+_OPENCODE_SCRIPT_PATH = "/sandbox/opencode_client.py"
+_OPENCODE_LABEL = "opencode-sdk"
+
+
+async def _run_opencode_client(
+    sb: SandboxBackend,
+    args: list[str],
+    *,
+    timeout: int = 60,
+    quiet: bool = False,
+    stream_output: bool = False,
+    on_stderr_line: Callable[[str], Awaitable[None]] | None = None,
+) -> dict[str, Any] | None:
+    return await run_sandbox_client(
+        sb, _OPENCODE_SCRIPT_PATH, _OPENCODE_LABEL, args,
+        timeout=timeout, quiet=quiet,
+        stream_output=stream_output, on_stderr_line=on_stderr_line,
+    )
+
+
+async def opencode_create_session(sb: SandboxBackend, title: str) -> str | None:
+    response = await _run_opencode_client(
+        sb, ["create-session", "--title", title], timeout=60,
+    )
+    if response is None:
+        return None
+    if not response.get("ok"):
+        builtins.print(
+            f"[session] create failed: {response.get('error')}", flush=True,
+        )
+        return None
+    body = response.get("body", {})
+    session_id = body.get("id") if isinstance(body, dict) else None
+    builtins.print(f"[session] created id={session_id}", flush=True)
+    return session_id
+
+
+async def opencode_ensure_provider_connected(
+    sb: SandboxBackend, api_key: str,
+) -> None:
+    response = await _run_opencode_client(
+        sb, ["provider-status"], timeout=30, quiet=True,
+    )
+    if (
+        response
+        and response.get("ok")
+        and isinstance(response.get("body"), dict)
+    ):
+        connected = response["body"].get("connected", [])
+        builtins.print(f"[provider] connected={connected}", flush=True)
+        if isinstance(connected, list) and "opencode" in connected:
+            return
+
+    builtins.print(
+        "[provider] opencode not connected, setting auth...", flush=True,
+    )
+    api_key_path = "/tmp/auth_opencode_api_key.txt"
+    await sb.write_file(api_key_path, api_key, ensure_dir=False)
+    auth_response = await _run_opencode_client(
+        sb, ["provider-auth", "--api-key-file", api_key_path], timeout=30,
+    )
+    if auth_response is None or not auth_response.get("ok"):
+        raise RuntimeError(
+            f"Failed to authenticate provider: {auth_response}",
+        )
+
+
+async def opencode_get_all_messages(
+    sb: SandboxBackend, session_id: str,
+) -> list[dict[str, Any]]:
+    response = await _run_opencode_client(
+        sb, ["list-messages", "--session-id", session_id],
+        timeout=60, quiet=True,
+    )
+    if response is None or not response.get("ok"):
+        return []
+    body = response.get("body")
+    if isinstance(body, list):
+        return body
+    if isinstance(body, dict):
+        for key in ("items", "messages", "data", "results"):
+            value = body.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+async def opencode_get_all_sessions(sb: SandboxBackend) -> list[dict[str, Any]]:
+    response = await _run_opencode_client(
+        sb, ["list-sessions"], timeout=60, quiet=True,
+    )
+    if response is None or not response.get("ok"):
+        return []
+    body = response.get("body")
+    if isinstance(body, list):
+        return body
+    if isinstance(body, dict):
+        for key in ("items", "sessions", "data", "results"):
+            value = body.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def _session_object_id(session: dict[str, Any]) -> str | None:
+    for key in ("id", "sessionID", "session_id"):
+        value = session.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _session_object_parent_id(session: dict[str, Any]) -> str | None:
+    for key in ("parentID", "parent_id", "parentId"):
+        value = session.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _get_session_family(
+    root_session_id: str, sessions: list[dict[str, Any]],
+) -> list[str]:
+    known_ids = {
+        sid
+        for s in sessions
+        if isinstance(s, dict)
+        if (sid := _session_object_id(s))
+    }
+    if root_session_id not in known_ids:
+        return [root_session_id]
+
+    children_by_parent: dict[str, list[str]] = {}
+    for s in sessions:
+        if not isinstance(s, dict):
+            continue
+        sid = _session_object_id(s)
+        parent_id = _session_object_parent_id(s)
+        if sid and parent_id:
+            children_by_parent.setdefault(parent_id, []).append(sid)
+
+    family: list[str] = []
+    queue = [root_session_id]
+    seen: set[str] = set()
+    while queue:
+        current = queue.pop(0)
+        if current in seen:
+            continue
+        seen.add(current)
+        family.append(current)
+        queue.extend(children_by_parent.get(current, []))
+    return family
+
+
+def _message_created_ms(message: dict[str, Any]) -> int:
+    info = message.get("info", {})
+    time_info = info.get("time", {})
+    created = time_info.get("created")
+    return int(created) if isinstance(created, int) else 0
+
+
+async def opencode_collect_turn_messages(
+    sb: SandboxBackend,
+    root_session_id: str,
+    seen_message_ids: set[str],
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+    sessions = await opencode_get_all_sessions(sb)
+    session_ids = _get_session_family(root_session_id, sessions)
+    session_map: dict[str, dict[str, Any]] = {}
+    for s in sessions:
+        if not isinstance(s, dict):
+            continue
+        sid = _session_object_id(s)
+        if sid and sid in session_ids:
+            session_map[sid] = s
+
+    message_results = await asyncio.gather(
+        *[opencode_get_all_messages(sb, sid) for sid in session_ids],
+    )
+
+    all_messages: list[dict[str, Any]] = []
+    for sid, messages in zip(session_ids, message_results, strict=False):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            info = message.setdefault("info", {})
+            if "sessionID" not in info:
+                info["sessionID"] = sid
+            all_messages.append(message)
+
+    all_messages.sort(key=_message_created_ms)
+
+    new_messages: list[dict[str, Any]] = []
+    for message in all_messages:
+        mid = agent_message_id(message)
+        if mid and mid in seen_message_ids:
+            continue
+        if mid:
+            seen_message_ids.add(mid)
+        new_messages.append(message)
+
+    session_objects = [
+        session_map[sid] for sid in session_ids if sid in session_map
+    ]
+    return session_objects, session_ids, new_messages
+
+
+async def _opencode_send_message_blocking(
+    sb: SandboxBackend,
+    session_id: str,
+    text: str,
+    timeout: int,
+    remaining_parts_budget: int,
+    on_stream_part: Callable[[dict[str, Any]], Awaitable[None]] | None,
+) -> dict[str, Any] | None:
+    prompt_path = "/tmp/prompt.txt"
+    await sb.write_file(prompt_path, text, ensure_dir=False)
+    builtins.print(
+        f"[prompt] sending message ({len(text)} chars), "
+        f"waiting up to {timeout}s...",
+        flush=True,
+    )
+
+    async def handle_stderr_line(line: str) -> None:
+        await parse_trace_event_line(line, on_stream_part)
+
+    response = await _run_opencode_client(
+        sb,
+        [
             "chat-stream",
-            "--session-id",
-            session_id,
-            "--text-file",
-            prompt_path,
-            "--model",
-            model,
-            "--max-parts",
-            str(remaining_parts_budget),
-        ]
-        if self._api_key_file:
-            args.extend(["--api-key-file", self._api_key_file])
-        async def handle_stderr_line(line: str) -> None:
-            if on_stream_part is None:
-                return
-            stripped = line.strip()
-            if not stripped.startswith(TRACE_EVENT_PREFIX):
-                return
-            payload = stripped[len(TRACE_EVENT_PREFIX):].strip()
-            if not payload:
-                return
-            try:
-                event_obj = json.loads(payload)
-            except json.JSONDecodeError:
-                return
-            if isinstance(event_obj, dict):
-                await on_stream_part(event_obj)
+            "--session-id", session_id,
+            "--text-file", prompt_path,
+            "--max-parts", str(remaining_parts_budget),
+        ],
+        timeout=timeout,
+        stream_output=True,
+        on_stderr_line=handle_stderr_line,
+    )
+    if response is None:
+        return None
 
-        response = await run_codex_client(
-            sb,
-            args,
-            timeout=timeout,
-            stream_output=True,
-            on_stderr_line=handle_stderr_line,
+    status_code = response.get("status_code")
+    ok = bool(response.get("ok"))
+    body = response.get("body")
+    meta = response.get("meta")
+    meta_obj = meta if isinstance(meta, dict) else {}
+    aborted_for_part_limit = bool(meta_obj.get("aborted_for_part_limit"))
+    builtins.print(f"[prompt] done http={status_code} ok={ok}", flush=True)
+
+    if not ok:
+        if aborted_for_part_limit:
+            builtins.print(
+                "[prompt] part limit reached during stream; "
+                "ending current turn",
+                flush=True,
+            )
+            if isinstance(body, dict):
+                stream_meta = body.get("_stream")
+                stream_obj = (
+                    stream_meta if isinstance(stream_meta, dict) else {}
+                )
+                stream_obj.update(meta_obj)
+                body["_stream"] = stream_obj
+                return body
+            return {"_stream": dict(meta_obj)}
+        error_text = str(response.get("error") or body)
+        if len(error_text) > 1000:
+            error_text = error_text[:1000] + "...[truncated]"
+        builtins.print(f"[prompt] ERROR: {error_text}", flush=True)
+        return None
+
+    if not isinstance(body, dict):
+        if aborted_for_part_limit:
+            return {"_stream": dict(meta_obj)}
+        builtins.print(
+            f"[prompt] unexpected response type: {type(body).__name__}",
+            flush=True,
         )
-        if response is None:
-            return None
-        if not response.get("ok"):
-            print(f"[codex] turn failed: {truncate_text(str(response.get('error')), limit=800)}")
-            return None
-        body = response.get("body")
-        if not isinstance(body, dict):
-            print("[codex] missing body in response")
-            return None
+        return None
 
-        updated_session_id = body.get("_session_id")
-        effective_session_id = (
-            updated_session_id
-            if isinstance(updated_session_id, str) and updated_session_id
-            else session_id
+    stream_meta = body.get("_stream")
+    stream_obj = stream_meta if isinstance(stream_meta, dict) else {}
+    stream_obj.update(meta_obj)
+    body["_stream"] = stream_obj
+    return body
+
+
+async def opencode_run_turn(
+    sb: SandboxBackend,
+    session_id: str,
+    model: str,
+    prompt_text: str,
+    seen_message_ids: set[str],
+    timeout: int,
+    remaining_parts_budget: int,
+    on_stream_part: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+) -> AgentTurnOutcome | None:
+    response = await _opencode_send_message_blocking(
+        sb, session_id, prompt_text,
+        timeout=timeout,
+        remaining_parts_budget=remaining_parts_budget,
+        on_stream_part=on_stream_part,
+    )
+    if response is None:
+        return None
+    session_objects, session_ids, new_messages = (
+        await opencode_collect_turn_messages(
+            sb, session_id, seen_message_ids,
         )
+    )
+    return AgentTurnOutcome(
+        session_id=session_id,
+        response=response,
+        session_objects=session_objects,
+        session_ids=session_ids,
+        new_messages=new_messages,
+    )
 
-        message_obj = body.get("_message")
-        new_messages: list[dict[str, Any]] = []
-        if isinstance(message_obj, dict):
-            mid = message_id(message_obj)
-            if mid and mid in seen_message_ids:
-                pass
-            else:
-                if mid:
-                    seen_message_ids.add(mid)
-                new_messages.append(message_obj)
-        if not new_messages:
-            fallback_msg = {
-                "info": {
-                    "id": f"{effective_session_id}:{int(time.time() * 1000)}",
-                    "role": "assistant",
-                    "sessionID": effective_session_id,
-                    "time": {"created": int(time.time() * 1000)},
-                },
-                "parts": body.get("parts", []),
-            }
-            fallback_mid = message_id(fallback_msg)
-            if fallback_mid:
-                seen_message_ids.add(fallback_mid)
-            new_messages.append(fallback_msg)
 
-        session_obj = {"id": effective_session_id, "provider": "codex"}
-        return AgentTurnOutcome(
-            session_id=effective_session_id,
-            response=body,
-            session_objects=[session_obj],
-            session_ids=[effective_session_id],
-            new_messages=new_messages,
+# ---------------------------------------------------------------------------
+# Codex agent functions
+# ---------------------------------------------------------------------------
+
+_CODEX_SCRIPT_PATH = "/sandbox/codex_client.py"
+_CODEX_LABEL = "codex-cli"
+
+
+async def _run_codex_client(
+    sb: SandboxBackend,
+    args: list[str],
+    *,
+    timeout: int = 60,
+    quiet: bool = False,
+    stream_output: bool = False,
+    on_stderr_line: Callable[[str], Awaitable[None]] | None = None,
+) -> dict[str, Any] | None:
+    return await run_sandbox_client(
+        sb, _CODEX_SCRIPT_PATH, _CODEX_LABEL, args,
+        timeout=timeout, quiet=quiet,
+        stream_output=stream_output, on_stderr_line=on_stderr_line,
+    )
+
+
+async def codex_run_turn(
+    sb: SandboxBackend,
+    session_id: str,
+    model: str,
+    prompt_text: str,
+    seen_message_ids: set[str],
+    timeout: int,
+    remaining_parts_budget: int,
+    on_stream_part: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    api_key_file: str | None = None,
+) -> AgentTurnOutcome | None:
+    prompt_path = "/tmp/prompt.txt"
+    await sb.write_file(prompt_path, prompt_text, ensure_dir=False)
+    args = [
+        "chat-stream",
+        "--session-id", session_id,
+        "--text-file", prompt_path,
+        "--model", model,
+        "--max-parts", str(remaining_parts_budget),
+    ]
+    if api_key_file:
+        args.extend(["--api-key-file", api_key_file])
+
+    async def handle_stderr_line(line: str) -> None:
+        await parse_trace_event_line(line, on_stream_part)
+
+    response = await _run_codex_client(
+        sb, args,
+        timeout=timeout,
+        stream_output=True,
+        on_stderr_line=handle_stderr_line,
+    )
+    if response is None:
+        return None
+    if not response.get("ok"):
+        error_text = str(response.get("error"))
+        if len(error_text) > 800:
+            error_text = error_text[:800] + "...[truncated]"
+        builtins.print(
+            f"[codex] turn failed: {error_text}", flush=True,
         )
+        return None
+    body = response.get("body")
+    if not isinstance(body, dict):
+        builtins.print("[codex] missing body in response", flush=True)
+        return None
 
-    async def collect_crash_messages(
-        self,
-        sb: SandboxBackend,
-        session_id: str,
-        seen_message_ids: set[str],
-    ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
-        return [], [session_id], []
+    updated_session_id = body.get("_session_id")
+    effective_session_id = (
+        updated_session_id
+        if isinstance(updated_session_id, str) and updated_session_id
+        else session_id
+    )
 
+    message_obj = body.get("_message")
+    new_messages: list[dict[str, Any]] = []
+    if isinstance(message_obj, dict):
+        mid = agent_message_id(message_obj)
+        if mid and mid in seen_message_ids:
+            pass
+        else:
+            if mid:
+                seen_message_ids.add(mid)
+            new_messages.append(message_obj)
+    if not new_messages:
+        fallback_msg = {
+            "info": {
+                "id": f"{effective_session_id}:{int(time.time() * 1000)}",
+                "role": "assistant",
+                "sessionID": effective_session_id,
+                "time": {"created": int(time.time() * 1000)},
+            },
+            "parts": body.get("parts", []),
+        }
+        fallback_mid = agent_message_id(fallback_msg)
+        if fallback_mid:
+            seen_message_ids.add(fallback_mid)
+        new_messages.append(fallback_msg)
 
-def get_agent_backend(agent: str) -> AgentBackend:
-    if agent == "opencode":
-        return OpenCodeBackend()
-    if agent == "codex":
-        return CodexBackend()
-    raise ValueError(f"Unsupported agent: {agent}")
+    session_obj = {"id": effective_session_id, "provider": "codex"}
+    return AgentTurnOutcome(
+        session_id=effective_session_id,
+        response=body,
+        session_objects=[session_obj],
+        session_ids=[effective_session_id],
+        new_messages=new_messages,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2449,8 +2210,7 @@ async def _run_trajectory_impl(
     env_files = load_environment_files(env_config.environment_dir)
 
     effective_max_parts = max_parts
-    backend = get_agent_backend(agent)
-    resolved_model = backend.resolve_model(model)
+    resolved_model = resolve_model(agent, model)
     existing_trace = load_trace_snapshot(trajectory_id) if resume else None
     if existing_trace is not None and existing_trace.agent != agent:
         print(
@@ -2528,10 +2288,17 @@ async def _run_trajectory_impl(
         start_time = time.monotonic()
 
         # --- Setup ---
-        await backend.setup_sandbox(
-            sb, resolved_model, agent_api_key, codex_auth_json,
-            env_config=env_config, env_files=env_files,
-        )
+        setup_script = env_config.setup_script if env_config else ""
+        if agent == "opencode":
+            await setup_sandbox_opencode(
+                sb, resolved_model, agent_api_key,
+                setup_script=setup_script, env_files=env_files,
+            )
+        else:
+            await setup_sandbox_codex(
+                sb, resolved_model, agent_api_key, codex_auth_json,
+                setup_script=setup_script, env_files=env_files,
+            )
 
         resume_commit = get_trace_latest_commit(existing_trace) if existing_trace else None
         if existing_trace is not None and isinstance(resume_commit, str) and resume_commit:
@@ -2541,11 +2308,20 @@ async def _run_trajectory_impl(
                 commit=resume_commit,
             )
 
-        session_id = await backend.create_session(sb, trajectory_id)
+        if agent == "opencode":
+            session_id = await opencode_create_session(
+                sb, title=f"trajectory-{trajectory_id}",
+            )
+        else:
+            session_id = f"pending-{trajectory_id}"
         if not session_id:
             raise RuntimeError(f"Failed to create session for agent={agent}")
 
-        await backend.ensure_authenticated(sb, agent_api_key, codex_auth_json)
+        if agent == "opencode":
+            await opencode_ensure_provider_connected(sb, agent_api_key)
+        codex_api_key_file = (
+            "/tmp/upload/codex_api_key.txt" if agent == "codex" and agent_api_key else None
+        )
 
         if existing_trace is not None:
             agent_trace = existing_trace
@@ -2849,7 +2625,12 @@ async def _run_trajectory_impl(
                 )
 
                 # Send message and BLOCK until agent finishes
-                turn_outcome = await backend.run_turn(
+                run_turn_fn = (
+                    opencode_run_turn
+                    if agent == "opencode"
+                    else codex_run_turn
+                )
+                turn_outcome = await run_turn_fn(
                     sb=sb,
                     session_id=session_id,
                     model=resolved_model,
@@ -2858,6 +2639,8 @@ async def _run_trajectory_impl(
                     timeout=turn_timeout_seconds,
                     remaining_parts_budget=per_call_parts_budget,
                     on_stream_part=stream_part_cb,
+                    **({"api_key_file": codex_api_key_file}
+                       if agent == "codex" else {}),
                 )
                 part_count = stream_part_counter[0]
                 git_commit = stream_git_commit_ref[0]
@@ -2872,7 +2655,14 @@ async def _run_trajectory_impl(
                     )
                     await dump_sandbox_logs(sb, agent=agent)
                     if consecutive_turn_failures <= TURN_RECOVERY_RETRIES:
-                        recovered_session_id = await backend.create_session(sb, trajectory_id)
+                        if agent == "opencode":
+                            recovered_session_id = await opencode_create_session(
+                                sb, title=f"trajectory-{trajectory_id}",
+                            )
+                        else:
+                            recovered_session_id = (
+                                f"recovery-{trajectory_id}-{consecutive_turn_failures}"
+                            )
                         if recovered_session_id:
                             session_id = recovered_session_id
                             agent_trace.session_id = recovered_session_id
@@ -2981,13 +2771,14 @@ async def _run_trajectory_impl(
             end_reason = "agent_error"
             # Save whatever messages we have
             try:
-                _, _, crash_new_messages = (
-                    await backend.collect_crash_messages(
-                        sb,
-                        session_id,
-                        seen_message_ids,
+                if agent == "opencode":
+                    _, _, crash_new_messages = (
+                        await opencode_collect_turn_messages(
+                            sb, session_id, seen_message_ids,
+                        )
                     )
-                )
+                else:
+                    crash_new_messages = []
                 if crash_new_messages:
                     crash_record = TurnRecord(
                         trajectory_id=trajectory_id,
