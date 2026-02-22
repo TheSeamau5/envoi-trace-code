@@ -1,9 +1,10 @@
 """
-Short launcher for trajectory runs.
+envoi-trace CLI.
 
-Primary usage:
-    uv run trace
-    uv run trace --agent codex --max-parts 100 --detach
+Usage:
+    envoi-trace --task examples/tasks/c_compiler --env examples/environments/c_compiler
+    envoi-trace --agent codex --max-parts 1000 --task <path> --env <path>
+    envoi-trace graph <trajectory_id>
 """
 
 from __future__ import annotations
@@ -33,6 +34,10 @@ def _common_runner_args(args: argparse.Namespace, trajectory_id: str) -> list[st
         str(args.max_parts),
         "--trajectory-id",
         trajectory_id,
+        "--task-dir",
+        str(args.task),
+        "--environment-dir",
+        str(args.env),
     ]
     if args.model:
         parts.extend(["--model", args.model])
@@ -42,8 +47,6 @@ def _common_runner_args(args: argparse.Namespace, trajectory_id: str) -> list[st
         parts.extend(["--sandbox-provider", args.sandbox])
     if args.agent == "codex" and args.codex_auth_file:
         parts.extend(["--codex-auth-file", args.codex_auth_file])
-    if getattr(args, "task", None) and args.task != "c_compiler":
-        parts.extend(["--task", args.task])
     return parts
 
 
@@ -101,14 +104,14 @@ def load_trace_session_end(
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Launch runner.py with short defaults.",
-    )
+def _add_run_args(parser: argparse.ArgumentParser) -> None:
+    """Add run-mode arguments to a parser."""
     parser.set_defaults(non_preemptible=True)
     parser.add_argument("--agent", choices=["codex", "opencode"], default="codex")
     parser.add_argument("--model", default=None)
     parser.add_argument("--max-parts", type=int, default=1000)
+    parser.add_argument("--task", required=True, help="Path to task directory.")
+    parser.add_argument("--env", required=True, help="Path to environment directory.")
     parser.add_argument("--message-timeout-seconds", type=int, default=None)
     parser.add_argument(
         "--non-preemptible",
@@ -132,16 +135,11 @@ def main() -> None:
     parser.add_argument("--trajectory-id", default=None)
     parser.add_argument("--codex-auth-file", default="~/.codex/auth.json")
     parser.add_argument(
-        "--task",
-        default="c_compiler",
-        help="Task name to run (default: c_compiler).",
-    )
-    parser.add_argument(
         "--auto-resume",
         dest="auto_resume",
         action="store_true",
         default=True,
-        help="Automatically relaunch the same trajectory ID on retryable failures (default).",
+        help="Automatically relaunch on retryable failures (default).",
     )
     parser.add_argument(
         "--no-auto-resume",
@@ -153,7 +151,7 @@ def main() -> None:
         "--max-restarts",
         type=int,
         default=20,
-        help="Maximum number of relaunches for a trajectory (0 means unlimited).",
+        help="Maximum number of relaunches (0 = unlimited).",
     )
     parser.add_argument(
         "--restart-delay-seconds",
@@ -161,8 +159,10 @@ def main() -> None:
         default=10,
         help="Delay between relaunch attempts.",
     )
-    args = parser.parse_args()
 
+
+def _run(args: argparse.Namespace) -> None:
+    """Execute a trajectory run."""
     trajectory_id = args.trajectory_id or str(uuid.uuid4())
     bucket = os.environ.get("AWS_S3_BUCKET", "envoi-trace-data")
     trace_uri = artifact_uri(bucket, trajectory_id, "trace.parquet")
@@ -174,11 +174,11 @@ def main() -> None:
     print(f"TRACE_S3_URI: {trace_uri}", flush=True)
     print(f"BUNDLE_S3_URI: {bundle_uri}", flush=True)
     print(
-        "agent="
-        f"{args.agent} max_parts={args.max_parts} detach={args.detach} "
-        f"non_preemptible={args.non_preemptible}",
+        f"agent={args.agent} max_parts={args.max_parts} "
+        f"detach={args.detach} non_preemptible={args.non_preemptible}",
         flush=True,
     )
+    print(f"task={args.task} env={args.env}", flush=True)
     print(banner, flush=True)
 
     print(f"sandbox={args.sandbox}", flush=True)
@@ -230,6 +230,60 @@ def main() -> None:
             flush=True,
         )
         time.sleep(max(0, args.restart_delay_seconds))
+
+
+def _graph(args: argparse.Namespace) -> None:
+    """Execute graph generation (delegates to graph_trace)."""
+    import asyncio
+    import sys
+
+    from scripts.graph_trace import async_main as graph_async_main
+
+    argv_backup = sys.argv
+    sys.argv = ["envoi-trace graph", args.trajectory_id]
+    if args.bucket:
+        sys.argv.extend(["--bucket", args.bucket])
+    if args.output:
+        sys.argv.extend(["--output", args.output])
+    if args.part is not None:
+        sys.argv.extend(["--part", str(args.part)])
+    if args.checkout_dest:
+        sys.argv.extend(["--checkout-dest", args.checkout_dest])
+    try:
+        asyncio.run(graph_async_main())
+    finally:
+        sys.argv = argv_backup
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="envoi-trace",
+        description="envoi-trace: run agent trajectories and build graphs.",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    # graph subcommand
+    graph_parser = subparsers.add_parser(
+        "graph", help="Build graph artifacts from a trajectory.",
+    )
+    graph_parser.add_argument("trajectory_id", help="Trajectory ID in S3.")
+    graph_parser.add_argument(
+        "--bucket",
+        default=os.environ.get("AWS_S3_BUCKET", "envoi-trace-data"),
+    )
+    graph_parser.add_argument("--output", default=None)
+    graph_parser.add_argument("--part", type=int, default=None)
+    graph_parser.add_argument("--checkout-dest", default=None)
+
+    # Default (no subcommand) = run mode: add run args to the main parser
+    _add_run_args(parser)
+
+    args = parser.parse_args()
+
+    if args.command == "graph":
+        _graph(args)
+    else:
+        _run(args)
 
 
 if __name__ == "__main__":

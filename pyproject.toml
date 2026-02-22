@@ -28,6 +28,7 @@ dev = [
 ]
 
 [project.scripts]
+envoi-trace = "scripts.trace:main"
 graph_trace = "scripts.graph_trace:main"
 trace = "scripts.trace:main"
 replay = "scripts.offline_replay:main"
@@ -37,7 +38,7 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["agents", "sandbox", "scripts", "tasks", "tasks.c_compiler"]
+packages = ["agents", "sandbox", "scripts", "utils"]
 py-modules = ["runner", "trace_format", "models"]
 
 [tool.ruff]
