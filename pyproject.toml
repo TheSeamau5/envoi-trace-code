@@ -39,7 +39,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["agents", "sandbox", "scripts", "utils"]
-py-modules = ["runner", "trace_format", "models"]
+py-modules = ["runner", "models"]
 
 [tool.ruff]
 line-length = 100

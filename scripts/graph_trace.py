@@ -20,7 +20,7 @@ from scripts.offline_replay import (
     now_iso,
     reconstruct_repo_at_part,
 )
-from trace_format import parquet_to_trace_dict
+from utils.trace_parquet import parquet_to_trace_dict
 
 
 def parse_int(value: Any) -> int | None:

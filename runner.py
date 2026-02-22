@@ -195,13 +195,10 @@ function_image = (
     modal.Image.debian_slim()
     .pip_install("boto3", "pydantic", "pyarrow")
     .add_local_file(
-        Path(__file__).parent / "trace_format.py",
-        remote_path="/root/trace_format.py",
-    )
-    .add_local_file(
         Path(__file__).parent / "models.py",
         remote_path="/root/models.py",
     )
+    .add_local_dir(Path(__file__).parent / "utils", remote_path="/root/utils")
     .add_local_dir(_EXAMPLES_DIR / "tasks", remote_path="/root/examples/tasks")
     .add_local_dir(Path(__file__).parent / "agents", remote_path="/root/agents")
     .add_local_dir(Path(__file__).parent / "sandbox", remote_path="/root/sandbox")

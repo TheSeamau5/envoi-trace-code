@@ -216,23 +216,16 @@ def compute_turn_timeout_seconds(
 
 
 def environment_upload_items(
-    py_files: dict[str, str] | None = None,
-    c_files: dict[str, str] | None = None,
-    txt_files: dict[str, str] | None = None,
-    *,
-    _env_py: dict[str, str] | None = None,
-    _env_c: dict[str, str] | None = None,
-    _env_txt: dict[str, str] | None = None,
+    py_files: dict[str, str],
+    c_files: dict[str, str],
+    txt_files: dict[str, str],
 ) -> list[tuple[str, str]]:
-    env_py = py_files if py_files is not None else (_env_py or {})
-    env_c = c_files if c_files is not None else (_env_c or {})
-    env_txt = txt_files if txt_files is not None else (_env_txt or {})
     items: list[tuple[str, str]] = []
-    for rel, content in env_py.items():
+    for rel, content in py_files.items():
         items.append((f"/environment/{rel}", content))
-    for rel, content in env_c.items():
+    for rel, content in c_files.items():
         items.append((f"/environment/{rel}", content))
-    for rel, content in env_txt.items():
+    for rel, content in txt_files.items():
         items.append((f"/environment/{rel}", content))
     return items
 

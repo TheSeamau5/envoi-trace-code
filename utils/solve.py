@@ -33,9 +33,6 @@ class SolveTracker:
             ):
                 self.solved.add(call.path)
 
-    def is_fully_solved(self) -> bool:
-        return self.solved >= self.required_paths_set
-
     def get_unsolved_paths(self) -> list[str]:
         return [p for p in self.required_paths if p not in self.solved]
 

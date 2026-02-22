@@ -9,8 +9,8 @@ from typing import Any
 import boto3
 
 from models import AgentTrace
-from trace_format import agent_trace_to_rows, parquet_to_trace_dict, write_trace_parquet
 from utils.helpers import tprint
+from utils.trace_parquet import agent_trace_to_rows, parquet_to_trace_dict, write_trace_parquet
 
 print = tprint
 

@@ -1,4 +1,4 @@
-"""Parquet trace format: schema, conversion, and round-trip support."""
+"""Parquet serialization for AgentTrace."""
 
 from __future__ import annotations
 
@@ -74,15 +74,9 @@ _JSON_PART_KEYS = (
 def _json_or_none(value: Any) -> str | None:
     if value is None:
         return None
-    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
-
-
-def _model_dump_or_none(value: Any) -> str | None:
-    if value is None:
-        return None
     if hasattr(value, "model_dump"):
-        return _json_or_none(value.model_dump(mode="json"))
-    return _json_or_none(value)
+        value = value.model_dump(mode="json")
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
 
 
 def _build_turn_map(trace: AgentTrace) -> dict[int, int]:
@@ -148,13 +142,13 @@ def agent_trace_to_rows(
             "tool_output": _json_or_none(part_rec.tool_output),
             "tool_error": _json_or_none(part_rec.tool_error),
             "tool_exit_code": part_rec.tool_exit_code,
-            "token_usage": _model_dump_or_none(part_rec.token_usage),
+            "token_usage": _json_or_none(part_rec.token_usage),
             "patch": part_rec.patch,
             "envoi_calls": _json_or_none(
                 [c.model_dump(mode="json") for c in part_rec.envoi_calls]
             ) if part_rec.envoi_calls else None,
-            "testing_state": _model_dump_or_none(part_rec.testing_state),
-            "repo_checkpoint": _model_dump_or_none(part_rec.repo_checkpoint),
+            "testing_state": _json_or_none(part_rec.testing_state),
+            "repo_checkpoint": _json_or_none(part_rec.repo_checkpoint),
             "turn": turn_map.get(part_rec.part) if part_rec.part is not None else None,
             "session_end_reason": se_reason,
             "session_end_total_parts": se_total_parts,
