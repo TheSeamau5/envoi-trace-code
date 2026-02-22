@@ -9,12 +9,11 @@ Primary usage:
 from __future__ import annotations
 
 import argparse
-import json
+import io
 import os
 import subprocess
 import time
 import uuid
-from typing import Any
 
 import boto3
 
@@ -66,8 +65,10 @@ def build_direct_command(args: argparse.Namespace, trajectory_id: str) -> list[s
     return command
 
 
-def load_trace_session_end(bucket: str, trajectory_id: str) -> tuple[str | None, int | None]:
-    key = f"trajectories/{trajectory_id}/agent_trace.json"
+def load_trace_session_end(
+    bucket: str, trajectory_id: str,
+) -> tuple[str | None, int | None]:
+    key = f"trajectories/{trajectory_id}/trace.parquet"
     client = boto3.client(
         "s3",
         aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
@@ -82,16 +83,18 @@ def load_trace_session_end(bucket: str, trajectory_id: str) -> tuple[str | None,
     if body is None:
         return None, None
     try:
-        payload: Any = json.loads(body.read().decode("utf-8"))
+        import pyarrow.parquet as pq
+
+        buf = io.BytesIO(body.read())
+        table = pq.read_table(
+            buf, columns=["session_end_reason", "session_end_total_parts"],
+        )
+        if table.num_rows == 0:
+            return None, None
+        reason = table.column("session_end_reason")[0].as_py()
+        total_parts = table.column("session_end_total_parts")[0].as_py()
     except Exception:  # noqa: BLE001
         return None, None
-    if not isinstance(payload, dict):
-        return None, None
-    session_end = payload.get("session_end")
-    if not isinstance(session_end, dict):
-        return None, None
-    reason = session_end.get("reason")
-    total_parts = session_end.get("total_parts")
     return (
         reason if isinstance(reason, str) and reason else None,
         total_parts if isinstance(total_parts, int) else None,
@@ -162,7 +165,7 @@ def main() -> None:
 
     trajectory_id = args.trajectory_id or str(uuid.uuid4())
     bucket = os.environ.get("AWS_S3_BUCKET", "envoi-trace-data")
-    trace_uri = artifact_uri(bucket, trajectory_id, "agent_trace.json")
+    trace_uri = artifact_uri(bucket, trajectory_id, "trace.parquet")
     bundle_uri = artifact_uri(bucket, trajectory_id, "repo.bundle")
 
     banner = "=" * 72

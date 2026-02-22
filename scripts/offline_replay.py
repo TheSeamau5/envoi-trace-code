@@ -2,7 +2,7 @@
 Offline trajectory replay and evaluation.
 
 Given:
-- agent_trace.json (local path or s3:// URI)
+- trace.parquet (local path or s3:// URI)
 - repo.bundle (local path or s3:// URI)
 
 This script reconstructs repository state per part, evaluates each unique
@@ -76,12 +76,16 @@ def download_if_needed(source: str, destination_dir: Path) -> Path:
     return local_path
 
 
-def load_agent_trace(path: Path) -> dict[str, Any]:
+def load_trace(path: Path) -> dict[str, Any]:
+    if path.suffix == ".parquet":
+        from trace_format import parquet_to_trace_dict
+
+        return parquet_to_trace_dict(str(path))
     data = json.loads(path.read_text())
     if not isinstance(data, dict):
-        raise ValueError("agent_trace.json must contain a JSON object")
+        raise ValueError("Trace file must contain a JSON object")
     if not isinstance(data.get("parts"), list) and not isinstance(data.get("turns"), list):
-        raise ValueError("agent_trace.json missing both 'parts' and 'turns' lists")
+        raise ValueError("Trace file missing both 'parts' and 'turns' lists")
     return data
 
 
@@ -530,7 +534,7 @@ def reconstruct_repo_at_part(
     part: int,
     destination: Path,
 ) -> dict[str, Any]:
-    trace = load_agent_trace(trace_path)
+    trace = load_trace(trace_path)
     commit, row = resolve_part_commit(trace, part)
     destination.parent.mkdir(parents=True, exist_ok=True)
     clone_bundle(bundle_path, destination)
@@ -555,7 +559,7 @@ async def replay_trace(
     fixtures_root: Path | None,
 ) -> dict[str, Any]:
     fixtures_root = fixtures_root or default_fixtures_root()
-    trace = load_agent_trace(trace_path)
+    trace = load_trace(trace_path)
     parts = extract_part_rows(trace)
     commit_order = get_unique_commits(parts)
 
@@ -820,7 +824,7 @@ async def analyze_trace(
 ) -> dict[str, Any]:
     fixtures_root = fixtures_root or default_fixtures_root()
     """Pull trace + bundle, evaluate every commit by suite, produce summary table."""
-    trace = load_agent_trace(trace_path)
+    trace = load_trace(trace_path)
     turn_stats = extract_turn_stats(trace)
 
     # Get unique commits from turns (in order)
@@ -910,7 +914,7 @@ async def async_main() -> None:
     )
     parser.add_argument(
         "--trace",
-        help="Local path or s3:// URI to agent_trace.json",
+        help="Local path or s3:// URI to trace.parquet",
     )
     parser.add_argument(
         "--bundle",
@@ -920,7 +924,7 @@ async def async_main() -> None:
         "--trajectory-id",
         help=(
             "If provided, trace and bundle are resolved as "
-            "s3://<bucket>/trajectories/<trajectory-id>/agent_trace.json and repo.bundle"
+            "s3://<bucket>/trajectories/<trajectory-id>/trace.parquet and repo.bundle"
         ),
     )
     parser.add_argument(
@@ -969,7 +973,7 @@ async def async_main() -> None:
     args = parser.parse_args()
 
     if args.trajectory_id:
-        trace_source = artifact_uri(args.bucket, args.trajectory_id, "agent_trace.json")
+        trace_source = artifact_uri(args.bucket, args.trajectory_id, "trace.parquet")
         bundle_source = artifact_uri(args.bucket, args.trajectory_id, "repo.bundle")
     else:
         trace_source = args.trace

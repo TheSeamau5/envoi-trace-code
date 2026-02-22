@@ -1,9 +1,8 @@
 """
 Main orchestrator for envoi-trace.
 
-Runs an agent backend with a part budget and saves a full `agent_trace.json`
-artifact containing per-part records, git checkpoints, and parsed envoi test
-calls.
+Runs an agent backend with a part budget and saves a trace.parquet artifact
+containing per-part records, git checkpoints, and parsed envoi test calls.
 
 Usage:
     modal run runner.py --agent opencode --max-parts 1000 --model opencode/gpt-5-nano
@@ -16,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import builtins
+import io
 import json
 import os
 import re
@@ -35,6 +35,7 @@ from agents.opencode import OPENCODE_CONFIG_TEMPLATE
 from sandbox.base import SandboxBackend
 from sandbox.modal import ModalSandbox
 from tasks.resolver import EnvConfig, resolve_task
+from trace_format import agent_trace_to_rows, parquet_to_trace_dict, write_trace_parquet
 
 app = modal.App("envoi-trace")
 
@@ -729,9 +730,10 @@ def get_bucket() -> str:
     return os.environ.get("AWS_S3_BUCKET", "envoi-trace-data")
 
 
-def save_agent_trace_snapshot(
+def save_trace_parquet(
     trajectory_id: str,
     trace: AgentTrace,
+    env_config: EnvConfig,
     *,
     allow_empty: bool = False,
 ) -> None:
@@ -740,15 +742,22 @@ def save_agent_trace_snapshot(
     if not allow_empty and turn_count == 0 and part_count == 0:
         return
 
-    s3 = get_s3_client()
-    bucket = get_bucket()
-    key = f"trajectories/{trajectory_id}/agent_trace.json"
-    payload = trace.model_dump(mode="json")
-    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    s3.put_object(Bucket=bucket, Key=key, Body=body)
-    print(
-        f"[s3] saved agent trace (parts={part_count}) to s3://{bucket}/{key}"
+    suites: dict[str, Any] = {}
+    for eval_rec in trace.evaluations.values():
+        if eval_rec.suite_results:
+            suites = eval_rec.suite_results
+
+    rows = agent_trace_to_rows(
+        trace,
+        environment=env_config.environment,
+        task_params=env_config.params,
+        suites=suites,
+        bundle_uri=artifact_uri(trajectory_id, "repo.bundle"),
     )
+    buf = io.BytesIO()
+    write_trace_parquet(rows, buf)
+    upload_file(trajectory_id, "trace.parquet", buf.getvalue())
+    print(f"[s3] saved trace.parquet (parts={part_count})")
 
 
 def upload_file(trajectory_id: str, filename: str, data: bytes) -> str:
@@ -765,14 +774,16 @@ def artifact_uri(trajectory_id: str, filename: str) -> str:
     return f"s3://{bucket}/{key}"
 
 
-def load_agent_trace_snapshot(trajectory_id: str) -> AgentTrace | None:
+def load_trace_snapshot(trajectory_id: str) -> AgentTrace | None:
     s3 = get_s3_client()
     bucket = get_bucket()
-    key = f"trajectories/{trajectory_id}/agent_trace.json"
+    key = f"trajectories/{trajectory_id}/trace.parquet"
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
     except Exception as error:  # noqa: BLE001
-        code = str(getattr(error, "response", {}).get("Error", {}).get("Code", "")).strip()
+        code = str(
+            getattr(error, "response", {}).get("Error", {}).get("Code", "")
+        ).strip()
         if code in {"NoSuchKey", "404", "NotFound"}:
             return None
         print(f"[resume] failed to load prior trace: {error}")
@@ -781,19 +792,17 @@ def load_agent_trace_snapshot(trajectory_id: str) -> AgentTrace | None:
     raw_body = response.get("Body")
     if raw_body is None:
         return None
-    payload_raw = raw_body.read()
     try:
-        payload_obj = json.loads(payload_raw.decode("utf-8"))
+        buf = io.BytesIO(raw_body.read())
+        trace_dict = parquet_to_trace_dict(buf)
     except Exception as error:  # noqa: BLE001
-        print(f"[resume] invalid JSON in prior trace: {error}")
+        print(f"[resume] failed to read parquet trace: {error}")
         return None
 
-    if not isinstance(payload_obj, dict):
-        return None
     try:
-        return AgentTrace.model_validate(payload_obj)
+        return AgentTrace.model_validate(trace_dict)
     except Exception as error:  # noqa: BLE001
-        print(f"[resume] failed to parse prior trace schema: {error}")
+        print(f"[resume] failed to parse trace schema: {error}")
         return None
 
 
@@ -803,7 +812,11 @@ def load_agent_trace_snapshot(trajectory_id: str) -> AgentTrace | None:
 
 function_image = (
     modal.Image.debian_slim()
-    .pip_install("boto3", "pydantic")
+    .pip_install("boto3", "pydantic", "pyarrow")
+    .add_local_file(
+        Path(__file__).parent / "trace_format.py",
+        remote_path="/root/trace_format.py",
+    )
     .add_local_dir(Path(__file__).parent / "tasks", remote_path="/root/tasks")
     .add_local_dir(Path(__file__).parent / "agents", remote_path="/root/agents")
     .add_local_dir(Path(__file__).parent / "sandbox", remote_path="/root/sandbox")
@@ -2150,6 +2163,7 @@ def make_stream_part_callback(
     trajectory_id: str,
     agent_trace: AgentTrace,
     tracker: SolveTracker,
+    env_config: EnvConfig,
     agent_name: str,
     resolved_model: str,
     effective_max_parts: int,
@@ -2335,7 +2349,7 @@ def make_stream_part_callback(
             turn_record.git_commit = git_commit_ref[0]
             if checkpoint is not None:
                 turn_record.repo_checkpoint = checkpoint
-            save_agent_trace_snapshot(trajectory_id, agent_trace)
+            save_trace_parquet(trajectory_id, agent_trace, env_config)
         except Exception as callback_err:
             print(f"[stream] failed to process live part event: {callback_err}")
 
@@ -2353,6 +2367,7 @@ async def end_session(
     part_count: int,
     turn_count: int,
     reason: Literal["solved", "part_limit", "timeout", "agent_error", "envoi_error"],
+    env_config: EnvConfig | None = None,
 ) -> None:
     print(f"[end] reason={reason} parts={part_count}")
 
@@ -2361,7 +2376,6 @@ async def end_session(
         return
 
     final_commit = await get_git_commit(sb)
-    trace_s3_uri = artifact_uri(agent_trace.trajectory_id, "agent_trace.json")
     bundle_s3_uri: str | None = None
 
     agent_trace.session_end = SessionEnd(
@@ -2370,7 +2384,6 @@ async def end_session(
         total_turns=turn_count,
         final_git_commit=final_commit,
     )
-    save_agent_trace_snapshot(agent_trace.trajectory_id, agent_trace)
 
     # Upload git bundle
     try:
@@ -2394,11 +2407,13 @@ async def end_session(
     except Exception as e:
         print(f"[bundle] failed: {e}")
 
+    trace_parquet_uri = artifact_uri(agent_trace.trajectory_id, "trace.parquet")
     agent_trace.artifacts = {
-        "agent_trace": trace_s3_uri,
+        "trace_parquet": trace_parquet_uri,
         "repo_bundle": bundle_s3_uri,
     }
-    save_agent_trace_snapshot(agent_trace.trajectory_id, agent_trace)
+    if env_config is not None:
+        save_trace_parquet(agent_trace.trajectory_id, agent_trace, env_config)
 
     print(
         f"[end] session ended: {reason}, {part_count} parts, commit={final_commit}"
@@ -2436,14 +2451,14 @@ async def _run_trajectory_impl(
     effective_max_parts = max_parts
     backend = get_agent_backend(agent)
     resolved_model = backend.resolve_model(model)
-    existing_trace = load_agent_trace_snapshot(trajectory_id) if resume else None
+    existing_trace = load_trace_snapshot(trajectory_id) if resume else None
     if existing_trace is not None and existing_trace.agent != agent:
         print(
             f"[resume] existing trajectory agent={existing_trace.agent} differs from "
             f"requested agent={agent}; starting new trace object"
         )
         existing_trace = None
-    trace_s3_uri = artifact_uri(trajectory_id, "agent_trace.json")
+    trace_s3_uri = artifact_uri(trajectory_id, "trace.parquet")
     bundle_s3_uri = artifact_uri(trajectory_id, "repo.bundle")
     banner = "=" * 72
     print(banner)
@@ -2549,7 +2564,7 @@ async def _run_trajectory_impl(
                 agent_model=resolved_model,
                 started_at=datetime.now(UTC).isoformat(),
             )
-        save_agent_trace_snapshot(trajectory_id, agent_trace)
+        save_trace_parquet(trajectory_id, agent_trace, env_config)
 
         evaluation_tasks: set[asyncio.Task[None]] = set()
         evaluation_commits: set[str] = set(agent_trace.evaluations.keys())
@@ -2572,7 +2587,7 @@ async def _run_trajectory_impl(
                 status="queued",
                 queued_at=queued_at,
             )
-            save_agent_trace_snapshot(trajectory_id, agent_trace)
+            save_trace_parquet(trajectory_id, agent_trace, env_config)
 
             async def _runner() -> None:
                 started_at = datetime.now(UTC).isoformat()
@@ -2587,7 +2602,7 @@ async def _run_trajectory_impl(
                     agent_trace.evaluations[commit] = evaluation
                 evaluation.status = "running"
                 evaluation.started_at = started_at
-                save_agent_trace_snapshot(trajectory_id, agent_trace)
+                save_trace_parquet(trajectory_id, agent_trace, env_config)
 
                 async with evaluation_semaphore:
                     run_payload: dict[str, Any] | None = None
@@ -2690,7 +2705,7 @@ async def _run_trajectory_impl(
                             f"[eval] commit {commit[:10]} status={evaluation.status} "
                             f"passed={evaluation.passed}/{evaluation.total}"
                         )
-                        save_agent_trace_snapshot(trajectory_id, agent_trace)
+                        save_trace_parquet(trajectory_id, agent_trace, env_config)
 
             task = asyncio.create_task(_runner())
             evaluation_tasks.add(task)
@@ -2821,6 +2836,7 @@ async def _run_trajectory_impl(
                     trajectory_id=trajectory_id,
                     agent_trace=agent_trace,
                     tracker=tracker,
+                    env_config=env_config,
                     agent_name=agent,
                     resolved_model=resolved_model,
                     effective_max_parts=effective_max_parts,
@@ -2860,7 +2876,7 @@ async def _run_trajectory_impl(
                         if recovered_session_id:
                             session_id = recovered_session_id
                             agent_trace.session_id = recovered_session_id
-                            save_agent_trace_snapshot(trajectory_id, agent_trace)
+                            save_trace_parquet(trajectory_id, agent_trace, env_config)
                             prompt_text = _followup()
                             continue
                     end_reason = "agent_error"
@@ -2924,7 +2940,7 @@ async def _run_trajectory_impl(
                             turn_record.git_commit = last_part_record.git_commit
                     else:
                         turn_record.git_commit = git_commit
-                save_agent_trace_snapshot(trajectory_id, agent_trace)
+                save_trace_parquet(trajectory_id, agent_trace, env_config)
 
                 if evaluation_tasks:
                     print("[eval] waiting for pending commit evaluations before next turn")
@@ -2987,7 +3003,7 @@ async def _run_trajectory_impl(
                         parts=[],
                     )
                     agent_trace.turns.append(crash_record)
-                    save_agent_trace_snapshot(trajectory_id, agent_trace)
+                    save_trace_parquet(trajectory_id, agent_trace, env_config)
                     print(f"[error] saved {len(crash_new_messages)} new messages before crash")
             except Exception:
                 print("[error] could not save crash messages")
@@ -3001,6 +3017,7 @@ async def _run_trajectory_impl(
             part_count,
             turn_count,
             end_reason,
+            env_config=env_config,
         )
         return trajectory_id
 
@@ -3016,6 +3033,7 @@ async def _run_trajectory_impl(
                     part_count,
                     turn_count,
                     "agent_error",
+                    env_config=env_config,
                 )
             except Exception as end_err:
                 print(f"[error] failed to finalize session after exception: {end_err}")

@@ -17,10 +17,10 @@ from typing import Any
 from scripts.offline_replay import (
     artifact_uri,
     download_if_needed,
-    load_agent_trace,
     now_iso,
     reconstruct_repo_at_part,
 )
+from trace_format import parquet_to_trace_dict
 
 
 def parse_int(value: Any) -> int | None:
@@ -472,7 +472,7 @@ async def async_main() -> None:
     )
     args = parser.parse_args()
 
-    trace_source = artifact_uri(args.bucket, args.trajectory_id, "agent_trace.json")
+    trace_source = artifact_uri(args.bucket, args.trajectory_id, "trace.parquet")
 
     if args.part is not None:
         bundle_source = artifact_uri(args.bucket, args.trajectory_id, "repo.bundle")
@@ -511,7 +511,7 @@ async def async_main() -> None:
     scratch = Path(tempfile.mkdtemp(prefix="graph-trace-artifacts-")).resolve()
     try:
         trace_path = download_if_needed(trace_source, scratch)
-        trace = load_agent_trace(trace_path)
+        trace = parquet_to_trace_dict(str(trace_path))
         report = build_report_from_trace(trace)
         charts = write_graph_artifacts(report, output_dir)
         counts = report.get("counts", {})

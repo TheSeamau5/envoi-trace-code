@@ -17,7 +17,7 @@ Core job:
 5. Persist artifacts to S3 for replay and analysis.
 
 Hard requirement:
-- Persist `agent_trace.json` after every recorded part.
+- Persist `trace.parquet` after every recorded part.
 - Create a git checkpoint immediately for any part that changed files.
 
 Schema policy:
@@ -49,20 +49,23 @@ Schema policy:
 - Artifact and replay contracts are keyed to part indices (`checkout-part`, `part_to_commit`).
 
 ## Architecture At A Glance
-- `task.py`: canonical agent definition (shared system prompt).
+- `tasks/c_compiler/task.py`: canonical task definition (prompts, setup script, test paths).
+- `tasks/resolver.py`: dynamic task resolution (`resolve_task()` → `EnvConfig`).
 - `runner.py`: main controller. Starts Modal sandbox runtime, runs agent turns, captures trace, checkpoints git, uploads artifacts.
+- `trace_format.py`: parquet trace schema, conversion, and round-trip support.
 - `sandbox/modal/setup.sh`: boots envoi runtime (`:8000`) and agent runtime tooling inside Modal sandbox.
 - `sandbox/modal/mcp_server.py`: exposes `run_tests(test_path)` via MCP; runs envoi tests against `/workspace`.
 - `agents/opencode.py`: OpenCode agent client wrapper (stable JSON surface + inline OpenCode config template).
 - `agents/codex.py`: Codex agent client wrapper (stable JSON surface).
-- `environment/main.py`: envoi environment entrypoint (build + test suites).
-- `environment/tests/*`: suite implementations (`basics`, `wacct`, `c_testsuite`, `torture`).
+- `environments/c_compiler/main.py`: envoi environment entrypoint (build + test suites).
+- `environments/c_compiler/tests/*`: suite implementations (`basics`, `wacct`, `c_testsuite`, `torture`).
 - `scripts/offline_replay.py`: offline artifact consumer (reconstruct repo at part `p`, replay tests by commit).
 
 ## Big Technical Decisions (Intent)
-- Single trace object (`agent_trace.json`) instead of append-only JSONL:
-  - Easier to store nested turn/part/checkpoint/test-state data.
-  - One canonical JSON document per trajectory.
+- Parquet trace format (`trace.parquet`):
+  - One row per part, trajectory-level fields denormalized into every row.
+  - Enables DuckDB cross-trace queries via S3 globbing.
+  - `session_end_reason IS NULL` means in-progress; non-null means completed.
 - Git-first state capture:
   - Checkpoint commits happen only when files changed (no duplicate commit noise).
   - Final `repo.bundle` makes full history portable.
@@ -72,18 +75,18 @@ Schema policy:
 
 ## Artifact Contract (S3)
 For trajectory `<id>`, artifacts are stored under:
-- `trajectories/<id>/agent_trace.json` (canonical trace)
+- `trajectories/<id>/trace.parquet` (canonical trace)
 - `trajectories/<id>/repo.bundle` (git history)
 
 Code-state source of truth:
 - `repo.bundle` contains full git history and is the canonical source for repository reconstruction.
-- `agent_trace.json` maps each part to commit metadata (`git_commit` / `repo_checkpoint`).
+- `trace.parquet` maps each part to commit metadata (`git_commit` / `repo_checkpoint`).
 
-`agent_trace.json` shape:
+`trace.parquet` schema (one row per part):
 - `parts`: canonical list of part records (source of truth)
-- `turns`: grouping metadata
+- Trajectory-level fields denormalized into every row
 
-Each part record includes:
+Each part row includes:
 - identity and timing:
   - `part`, `timestamp`, `duration_ms`
 - part semantics:
@@ -93,16 +96,15 @@ Each part record includes:
   - `summary` (concise content preview)
 - repository state:
   - `git_commit`
-  - `repo_checkpoint`: `commit_before`, `commit_after`, `changed_files`
+  - `repo_checkpoint`: `commit_before`, `commit_after`, `changed_files` (JSON string)
 - testing state:
-  - `envoi_calls` (new test calls observed on that part)
-  - `testing_state` (solved progress + latest test status)
-
-Top-level session summary includes:
-- `session_end.reason`
-- `session_end.total_parts`
-- `session_end.total_turns`
-- `session_end.final_git_commit`
+  - `envoi_calls` (new test calls observed on that part, JSON string)
+  - `testing_state` (solved progress + latest test status, JSON string)
+- session end (denormalized, null when in-progress):
+  - `session_end_reason`
+  - `session_end_total_parts`
+  - `session_end_total_turns`
+  - `session_end_final_commit`
 
 ## Quick Trace Commands
 Run a trajectory:
@@ -149,7 +151,7 @@ uv run replay \
 ```
 
 What it does:
-1. Resolves/downloads `agent_trace.json` and `repo.bundle`.
+1. Resolves/downloads `trace.parquet` and `repo.bundle`.
 2. Reads commit for part `p`.
 3. Clones bundle and checks out that commit.
 
@@ -168,13 +170,15 @@ Behavior:
 - Maps results back onto each part (`part_to_commit`, `part_evaluations`).
 
 ## Where To Edit What
-- Agent definition (shared prompt): `task.py`.
+- Task definition: `tasks/c_compiler/task.py`.
+- Task resolution: `tasks/resolver.py`.
 - Trace schema/capture behavior: `runner.py` (`PartRecord`, `TurnRecord`, `make_stream_part_callback`, main loop).
+- Trace format: `trace_format.py`.
 - OpenCode agent integration: `agents/opencode.py`.
 - Codex agent integration: `agents/codex.py`.
 - Sandbox boot/runtime services: `sandbox/modal/setup.sh`.
 - Tool exposure: `agents/opencode.py` (inline config template) and `sandbox/modal/mcp_server.py`.
-- Test suite behavior: `environment/tests/*.py`.
+- Test suite behavior: `environments/c_compiler/tests/*.py`.
 - Offline reconstruction/reporting: `scripts/offline_replay.py`.
 - Short launchers: `scripts/trace.py`, `scripts/graph_trace.py`.
 
@@ -206,7 +210,7 @@ Behavior:
   ```
 - Lint/check:
   ```bash
-  uv run ruff check task.py runner.py agents/opencode.py agents/codex.py scripts/offline_replay.py scripts/trace.py scripts/graph_trace.py
+  uv run ruff check
   ```
 
 ## Important Gotchas

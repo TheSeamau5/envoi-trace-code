@@ -87,15 +87,17 @@ uv run graph_trace <trajectory_id> --part <p>
 
 For trajectory `<id>`, artifacts are uploaded to:
 
-- `s3://<bucket>/trajectories/<id>/agent_trace.json`
+- `s3://<bucket>/trajectories/<id>/trace.parquet`
 - `s3://<bucket>/trajectories/<id>/repo.bundle`
 
-`agent_trace.json` is part-centric and records per-part timing, content summary, repo checkpoint state, and test call state.
+`trace.parquet` is part-centric (one row per part) and records per-part timing, content summary, repo checkpoint state, and test call state. `session_end_reason IS NULL` means the trace is in-progress.
 
 ## 6) Where To Change Behavior
 
-- Task definition and prompt: `task.py`
+- Task definition and prompt: `tasks/c_compiler/task.py`
+- Task resolution: `tasks/resolver.py`
 - Main orchestration: `runner.py`
+- Trace format: `trace_format.py`
 - Agent backends: `agents/codex.py`, `agents/opencode.py`
 - Modal sandbox runtime: `sandbox/modal/setup.sh`
 - Test MCP server: `sandbox/modal/mcp_server.py`
@@ -104,5 +106,5 @@ For trajectory `<id>`, artifacts are uploaded to:
 ## 7) Quick Dev Check
 
 ```bash
-uv run ruff check task.py runner.py agents/opencode.py agents/codex.py scripts/offline_replay.py scripts/trace.py scripts/graph_trace.py
+uv run ruff check
 ```

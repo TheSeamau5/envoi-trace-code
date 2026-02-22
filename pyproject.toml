@@ -14,6 +14,7 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "opencode-ai>=0.1.0a36",
     "matplotlib>=3.10.8",
+    "pyarrow>=17.0.0",
 ]
 
 [project.optional-dependencies]
@@ -37,7 +38,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["agents", "sandbox", "scripts", "tasks", "tasks.c_compiler"]
-py-modules = ["runner"]
+py-modules = ["runner", "trace_format"]
 
 [tool.ruff]
 line-length = 100
