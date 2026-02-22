@@ -137,11 +137,3 @@ class AgentTrace(BaseModel):
     evaluations: dict[str, EvaluationRecord] = Field(default_factory=dict)
     artifacts: dict[str, str | None] = Field(default_factory=dict)
     session_end: SessionEnd | None = None
-
-
-class AgentTurnOutcome(BaseModel):
-    session_id: str
-    response: dict[str, Any]
-    session_objects: list[dict[str, Any]] = Field(default_factory=list)
-    session_ids: list[str] = Field(default_factory=list)
-    new_messages: list[dict[str, Any]] = Field(default_factory=list)

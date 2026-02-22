@@ -1393,3 +1393,246 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# -------------------------------------------------------------------
+# CodexAgent: AgentBackend implementation (runner-side only)
+# -------------------------------------------------------------------
+# The code below is only executed when imported by runner.py, never
+# when this file runs as a standalone sandbox script.
+
+try:
+    import builtins as _builtins
+
+    from agents.base import AgentTurnOutcome as _AgentTurnOutcome
+    from sandbox.base import SandboxBackend as _SandboxBackend
+    from utils.helpers import run_sandbox_client as _run_sandbox_client
+    from utils.parsing import (
+        agent_message_id as _agent_message_id,
+    )
+    from utils.parsing import (
+        parse_trace_event_line as _parse_trace_event_line,
+    )
+
+    _CODEX_SCRIPT = "/sandbox/codex_client.py"
+    _CODEX_LABEL = "codex-cli"
+
+    class CodexAgent:
+        """AgentBackend implementation for Codex."""
+
+        @property
+        def name(self) -> str:
+            return "codex"
+
+        @property
+        def session_id(self) -> str | None:
+            return self._session_id
+
+        def __init__(self) -> None:
+            self._sb: _SandboxBackend | None = None
+            self._model: str = ""
+            self._api_key: str = ""
+            self._auth_json: str | None = None
+            self._api_key_file: str | None = None
+            self._session_id: str | None = None
+            self._seen_message_ids: set[str] = set()
+
+        # -- helpers ------------------------------------------------
+
+        async def _run_client(
+            self,
+            args: list[str],
+            *,
+            timeout: int = 60,
+            quiet: bool = False,
+            stream_output: bool = False,
+            on_stderr_line=None,
+        ) -> dict[str, Any] | None:
+            assert self._sb is not None
+            return await _run_sandbox_client(
+                self._sb,
+                _CODEX_SCRIPT,
+                _CODEX_LABEL,
+                args,
+                timeout=timeout,
+                quiet=quiet,
+                stream_output=stream_output,
+                on_stderr_line=on_stderr_line,
+            )
+
+        # -- protocol methods ---------------------------------------
+
+        async def start(
+            self,
+            *,
+            sb: _SandboxBackend,
+            model: str,
+            api_key: str,
+            setup_script: str = "",
+            env_files=None,
+            auth_json: str | None = None,
+            api_key_file: str | None = None,
+            **kwargs: Any,
+        ) -> None:
+            self._sb = sb
+            self._model = model
+            self._api_key = api_key
+            self._auth_json = auth_json
+            self._api_key_file = api_key_file
+
+        async def create_session(
+            self,
+            trajectory_id: str,
+        ) -> str:
+            self._session_id = f"pending-{trajectory_id}"
+            return self._session_id
+
+        async def run_turn(
+            self,
+            *,
+            prompt_text: str,
+            timeout: int,
+            remaining_parts_budget: int,
+            on_stream_part=None,
+        ) -> _AgentTurnOutcome | None:
+            assert self._sb is not None
+            prompt_path = "/tmp/prompt.txt"
+            await self._sb.write_file(
+                prompt_path,
+                prompt_text,
+                ensure_dir=False,
+            )
+            args = [
+                "chat-stream",
+                "--session-id",
+                self._session_id or "",
+                "--text-file",
+                prompt_path,
+                "--model",
+                self._model,
+                "--max-parts",
+                str(remaining_parts_budget),
+            ]
+            if self._api_key_file:
+                args.extend(
+                    ["--api-key-file", self._api_key_file],
+                )
+
+            async def handle_stderr_line(
+                line: str,
+            ) -> None:
+                await _parse_trace_event_line(
+                    line, on_stream_part,
+                )
+
+            response = await self._run_client(
+                args,
+                timeout=timeout,
+                stream_output=True,
+                on_stderr_line=handle_stderr_line,
+            )
+            if response is None:
+                return None
+            if not response.get("ok"):
+                error_text = str(response.get("error"))
+                if len(error_text) > 800:
+                    error_text = (
+                        error_text[:800]
+                        + "...[truncated]"
+                    )
+                _builtins.print(
+                    f"[codex] turn failed: {error_text}",
+                    flush=True,
+                )
+                return None
+            body = response.get("body")
+            if not isinstance(body, dict):
+                _builtins.print(
+                    "[codex] missing body in response",
+                    flush=True,
+                )
+                return None
+
+            updated_session_id = body.get("_session_id")
+            effective_session_id = (
+                updated_session_id
+                if isinstance(updated_session_id, str)
+                and updated_session_id
+                else self._session_id or ""
+            )
+
+            message_obj = body.get("_message")
+            new_messages: list[dict[str, Any]] = []
+            if isinstance(message_obj, dict):
+                mid = _agent_message_id(message_obj)
+                if mid and mid in self._seen_message_ids:
+                    pass
+                else:
+                    if mid:
+                        self._seen_message_ids.add(mid)
+                    new_messages.append(message_obj)
+            if not new_messages:
+                fallback_msg = {
+                    "info": {
+                        "id": (
+                            f"{effective_session_id}:"
+                            f"{int(time.time() * 1000)}"
+                        ),
+                        "role": "assistant",
+                        "sessionID": effective_session_id,
+                        "time": {
+                            "created": int(
+                                time.time() * 1000,
+                            ),
+                        },
+                    },
+                    "parts": body.get("parts", []),
+                }
+                fallback_mid = _agent_message_id(
+                    fallback_msg,
+                )
+                if fallback_mid:
+                    self._seen_message_ids.add(fallback_mid)
+                new_messages.append(fallback_msg)
+
+            session_obj = {
+                "id": effective_session_id,
+                "provider": "codex",
+            }
+            return _AgentTurnOutcome(
+                session_id=effective_session_id,
+                response=body,
+                session_objects=[session_obj],
+                session_ids=[effective_session_id],
+                new_messages=new_messages,
+            )
+
+        def on_turn_complete(
+            self,
+            outcome: _AgentTurnOutcome,
+        ) -> None:
+            self._session_id = outcome.session_id
+
+        def on_resume(
+            self,
+            existing_messages: list[dict[str, Any]],
+        ) -> None:
+            for msg in existing_messages:
+                mid = _agent_message_id(msg)
+                if mid:
+                    self._seen_message_ids.add(mid)
+
+        async def recover_session(
+            self,
+            trajectory_id: str,
+            attempt: int,
+        ) -> str:
+            sid = f"recovery-{trajectory_id}-{attempt}"
+            self._session_id = sid
+            return sid
+
+        async def stop(self) -> None:
+            pass
+
+except ImportError:
+    pass  # Running as standalone sandbox script

@@ -15,10 +15,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import builtins
-import io
 import json
 import os
-import re
 import shlex
 import time
 import uuid
@@ -27,72 +25,79 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-import boto3
 import modal
 
-from agents.opencode import OPENCODE_CONFIG_TEMPLATE
+from agents.base import AgentBackend
+from agents.codex import CodexAgent
+from agents.opencode import OPENCODE_CONFIG_TEMPLATE, OpenCodeAgent
 from models import (
     AgentTrace,
-    AgentTurnOutcome,
     EnvoiCall,
     EvaluationRecord,
-    PartRecord,
-    RepoCheckpoint,
     SessionEnd,
-    TestingState,
     TurnRecord,
 )
 from sandbox.base import SandboxBackend
 from sandbox.modal import ModalSandbox
 from tasks.resolver import EnvConfig, resolve_task
-from trace_format import agent_trace_to_rows, parquet_to_trace_dict, write_trace_parquet
+from utils.evaluation import (
+    EVALUATION_CONCURRENCY,
+    _extract_leaf_paths,
+    _extract_suite_roots,
+    run_commit_evaluation,
+)
+from utils.git import get_git_commit
+from utils.helpers import (
+    compute_turn_timeout_seconds,
+    decode_b64_to_text,
+    environment_upload_items,
+    load_environment_files,
+    load_local_codex_auth_json_b64,
+    parse_codex_auth_json,
+    resolve_model,
+    tprint,
+    truncate_text,
+    upload_files_parallel,
+)
+from utils.parsing import (
+    count_meaningful_parts,
+    extract_envoi_calls,
+    extract_turn_token_usage,
+    log_message_parts,
+)
+from utils.solve import SolveTracker
+from utils.storage import (
+    artifact_uri,
+    get_bucket,
+    get_s3_client,
+    load_trace_snapshot,
+    save_trace_parquet,
+    upload_file,
+)
+from utils.stream import make_stream_part_callback
 
 app = modal.App("envoi-trace")
 
-DEFAULT_OPENCODE_MODEL = "opencode/gpt-5-nano"
-DEFAULT_CODEX_MODEL = "gpt-5.3-codex"
 DEFAULT_AGENT = "codex"
 CODEX_HOME_DIR = "/tmp/codex-home"
-TRACE_EVENT_PREFIX = "TRACE_EVENT "
 MESSAGE_TIMEOUT_SECONDS = int(
     os.environ.get("MESSAGE_TIMEOUT_SECONDS", "600")
 )  # hard cap per message turn
-MIN_TURN_TIMEOUT_SECONDS = int(
-    os.environ.get("MIN_TURN_TIMEOUT_SECONDS", "45")
-)  # don't go lower than this for healthy request/response exchanges
-SECONDS_PER_REMAINING_PART = int(
-    os.environ.get("SECONDS_PER_REMAINING_PART", "60")
-)  # adaptive cap as part budget gets tight
-SETUP_UPLOAD_CONCURRENCY = max(1, int(os.environ.get("SETUP_UPLOAD_CONCURRENCY", "8")))
-EVALUATION_CONCURRENCY = max(1, int(os.environ.get("EVALUATION_CONCURRENCY", "1")))
-EVALUATION_TIMEOUT_SECONDS = max(60, int(os.environ.get("EVALUATION_TIMEOUT_SECONDS", "7200")))
-EVALUATION_ENVOI_URL = os.environ.get("EVALUATION_ENVOI_URL", "http://localhost:8000").strip() or "http://localhost:8000"
-EVALUATION_JSON_MARKER = "__ENVOI_EVAL_JSON__"
-GIT_RETRY_ATTEMPTS = max(1, int(os.environ.get("GIT_RETRY_ATTEMPTS", "4")))
-GIT_RETRY_BACKOFF_SECONDS = float(os.environ.get("GIT_RETRY_BACKOFF_SECONDS", "0.5"))
-RESUME_FROM_S3 = os.environ.get("RESUME_FROM_S3", "1").strip().lower() not in {"0", "false", "no"}
-INCREMENTAL_BUNDLE_UPLOAD = (
-    os.environ.get("INCREMENTAL_BUNDLE_UPLOAD", "1").strip().lower() not in {"0", "false", "no"}
+RESUME_FROM_S3 = (
+    os.environ.get("RESUME_FROM_S3", "1").strip().lower()
+    not in {"0", "false", "no"}
 )
-TURN_RECOVERY_RETRIES = max(0, int(os.environ.get("TURN_RECOVERY_RETRIES", "3")))
-
-
-# ---------------------------------------------------------------------------
-# Timestamped print
-# ---------------------------------------------------------------------------
-
-
-def ts() -> str:
-    return datetime.now(UTC).strftime("%H:%M:%S")
-
-
-def tprint(*args: Any, **kwargs: Any) -> None:
-    if "flush" not in kwargs:
-        kwargs["flush"] = True
-    builtins.print(f"[{ts()}]", *args, **kwargs)
+TURN_RECOVERY_RETRIES = max(
+    0, int(os.environ.get("TURN_RECOVERY_RETRIES", "3"))
+)
 
 
 print = tprint
+
+AGENT_BACKENDS: dict[str, type] = {
+    "opencode": OpenCodeAgent,
+    "codex": CodexAgent,
+}
 
 # ---------------------------------------------------------------------------
 # Load files at import time (Modal serializes these into the function image)
@@ -105,25 +110,6 @@ CODEX_CLIENT = (Path(__file__).parent / "agents" / "codex.py").read_text()
 OPENCODE_CONFIG = OPENCODE_CONFIG_TEMPLATE
 
 _DEFAULT_TASK = os.environ.get("ENVOI_TASK", "c_compiler")
-
-
-def load_environment_files(
-    env_dir: Path,
-) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
-    """Load py/c/txt files from an environment directory."""
-    py_files = {
-        str(p.relative_to(env_dir)): p.read_text()
-        for p in env_dir.rglob("*.py")
-    }
-    c_files = {
-        str(p.relative_to(env_dir)): p.read_text()
-        for p in env_dir.rglob("*.c")
-    }
-    txt_files = {
-        str(p.relative_to(env_dir)): p.read_text()
-        for p in env_dir.rglob("*.txt")
-    }
-    return py_files, c_files, txt_files
 
 
 _default_env = resolve_task(_DEFAULT_TASK)
@@ -155,469 +141,6 @@ enabled = true
 required = false
 tool_timeout_sec = 3600
 """
-
-
-# ---------------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------------
-
-
-def resolve_model(agent: str, model: str | None) -> str:
-    if agent == "opencode":
-        raw = model or DEFAULT_OPENCODE_MODEL
-        if "/" in raw:
-            return raw
-        return f"opencode/{raw}"
-    if agent == "codex":
-        return model or DEFAULT_CODEX_MODEL
-    raise ValueError(f"Unsupported agent: {agent}")
-
-
-def iso_from_epoch_ms(epoch_ms: int | None) -> str:
-    if isinstance(epoch_ms, int) and epoch_ms > 0:
-        return datetime.fromtimestamp(epoch_ms / 1000, UTC).isoformat()
-    return datetime.now(UTC).isoformat()
-
-
-def decode_b64_to_text(encoded: str, *, label: str) -> str:
-    try:
-        raw = base64.b64decode(encoded.encode("ascii"), validate=True)
-    except Exception as e:
-        raise RuntimeError(f"Invalid base64 content for {label}: {e}") from e
-    try:
-        return raw.decode("utf-8")
-    except Exception as e:
-        raise RuntimeError(f"Invalid UTF-8 content for {label}: {e}") from e
-
-
-def parse_codex_auth_json(raw_text: str, *, label: str) -> str:
-    try:
-        parsed = json.loads(raw_text)
-    except Exception as e:
-        raise RuntimeError(f"Invalid JSON content for {label}: {e}") from e
-    if not isinstance(parsed, dict):
-        raise RuntimeError(f"{label} must contain a JSON object")
-    return raw_text
-
-
-def load_local_codex_auth_json_b64(path_str: str) -> str | None:
-    candidate = Path(path_str).expanduser()
-    if not candidate.exists() or not candidate.is_file():
-        return None
-    raw = candidate.read_text()
-    parsed = parse_codex_auth_json(raw, label=str(candidate))
-    return base64.b64encode(parsed.encode("utf-8")).decode("ascii")
-
-
-def truncate_text(text: str, limit: int = 4000) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "\n...[truncated]"
-
-
-WORD_RE = re.compile(r"[A-Za-z0-9_']+")
-
-
-def word_count(text: str | None) -> int:
-    if not isinstance(text, str) or not text:
-        return 0
-    return len(WORD_RE.findall(text))
-
-
-def token_estimate(text: str | None) -> int:
-    if not isinstance(text, str) or not text:
-        return 0
-    # Rough estimate when provider-native token metrics are unavailable.
-    return max(1, round(len(text) / 4))
-
-
-def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-def merge_usage_maps(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
-    for key, value in incoming.items():
-        if key not in base:
-            base[key] = value
-            continue
-        existing = base[key]
-        if isinstance(existing, dict) and isinstance(value, dict):
-            merge_usage_maps(existing, value)
-        elif _is_number(existing) and _is_number(value):
-            base[key] = existing + value
-        else:
-            base[key] = value
-    return base
-
-
-def extract_turn_token_usage(
-    response: dict[str, Any],
-    new_messages: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    usage: dict[str, Any] = {}
-
-    for key in ("_usage", "usage", "token_usage", "tokens"):
-        candidate = response.get(key)
-        if isinstance(candidate, dict):
-            merge_usage_maps(usage, redact_secrets(candidate))
-
-    response_info = response.get("info")
-    if isinstance(response_info, dict):
-        info_tokens = response_info.get("tokens")
-        if isinstance(info_tokens, dict):
-            merge_usage_maps(usage, redact_secrets(info_tokens))
-
-    for message in new_messages:
-        if not isinstance(message, dict):
-            continue
-        info = message.get("info")
-        if not isinstance(info, dict):
-            continue
-        tokens = info.get("tokens")
-        if isinstance(tokens, dict):
-            merge_usage_maps(usage, redact_secrets(tokens))
-
-    return usage or None
-
-
-def redact_secrets(value: Any) -> Any:
-    if isinstance(value, dict):
-        redacted: dict[str, Any] = {}
-        for key, val in value.items():
-            if isinstance(key, str) and any(
-                token in key.lower() for token in ["key", "token", "secret", "password"]
-            ):
-                redacted[key] = "***" if val else val
-            else:
-                redacted[key] = redact_secrets(val)
-        return redacted
-    if isinstance(value, list):
-        return [redact_secrets(item) for item in value]
-    return value
-
-
-def compute_turn_timeout_seconds(
-    *,
-    remaining_parts: int,
-    remaining_run_seconds: float,
-    message_timeout_seconds: int,
-) -> int:
-    """Derive an adaptive per-turn timeout from remaining part and run budget."""
-    timeout_from_parts = max(
-        MIN_TURN_TIMEOUT_SECONDS,
-        remaining_parts * SECONDS_PER_REMAINING_PART,
-    )
-    timeout_from_run_budget = max(1, int(remaining_run_seconds))
-    return max(1, min(message_timeout_seconds, timeout_from_parts, timeout_from_run_budget))
-
-
-# ---------------------------------------------------------------------------
-# Solve tracker
-# ---------------------------------------------------------------------------
-
-
-class SolveTracker:
-    def __init__(self, required_paths: list[str]) -> None:
-        self.required_paths = required_paths
-        self.required_paths_set = set(required_paths)
-        self.solved: set[str] = set()
-        self.all_calls: list[EnvoiCall] = []
-        self._seen_call_keys: set[str] = set()
-
-    def _call_key(self, call: EnvoiCall) -> str:
-        return f"{call.path}|{call.timestamp}|{call.status_code}|{call.duration_ms}"
-
-    def update(self, envoi_calls: list[EnvoiCall]) -> None:
-        for call in envoi_calls:
-            key = self._call_key(call)
-            if key in self._seen_call_keys:
-                continue
-            self._seen_call_keys.add(key)
-            self.all_calls.append(call)
-            if call.result and call.result.total > 0 and call.result.passed == call.result.total:
-                self.solved.add(call.path)
-
-    def is_fully_solved(self) -> bool:
-        return self.solved >= self.required_paths_set
-
-    def get_unsolved_paths(self) -> list[str]:
-        return [p for p in self.required_paths if p not in self.solved]
-
-    def get_latest_call_for_path(self, path: str) -> EnvoiCall | None:
-        for call in reversed(self.all_calls):
-            if call.path == path:
-                return call
-        return None
-
-    def snapshot(self) -> TestingState:
-        latest = self.all_calls[-1] if self.all_calls else None
-        latest_passed = latest.result.passed if latest and latest.result else None
-        latest_total = latest.result.total if latest and latest.result else None
-        return TestingState(
-            solved_paths=len(self.solved),
-            total_paths=len(self.required_paths),
-            latest_path=latest.path if latest else None,
-            latest_passed=latest_passed,
-            latest_total=latest_total,
-            latest_status_code=latest.status_code if latest else None,
-            latest_error=latest.error if latest else None,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Message parsing
-# ---------------------------------------------------------------------------
-
-
-def summarize_tool_input(name: str, input_data: Any) -> str:
-    if not isinstance(input_data, dict):
-        return truncate_text(str(input_data), limit=200)
-    if name == "bash":
-        return truncate_text(input_data.get("command", ""), limit=200)
-    if name == "read":
-        return str(input_data.get("filePath") or input_data.get("path") or "?")
-    if name in {"write", "edit"}:
-        path = input_data.get("filePath") or input_data.get("path") or "?"
-        content = input_data.get("content") or input_data.get("newString") or ""
-        return f"{path} ({len(content)} bytes)"
-    if name == "run_tests":
-        return input_data.get("test_path", truncate_text(json.dumps(input_data), limit=200))
-    return truncate_text(json.dumps(input_data), limit=200)
-
-
-MEANINGFUL_PART_TYPES: set[str] = {
-    "reasoning",
-    "text",
-    "tool",
-    "tool_use",
-    "tool_result",
-    "patch",
-}
-
-
-def log_message_parts(message: dict[str, Any]) -> None:
-    """Print a human-readable summary of every part in a message."""
-    info = message.get("info", {})
-    role = info.get("role", "?")
-    parts = message.get("parts", [])
-    if not parts:
-        return
-    for part in parts:
-        ptype = part.get("type", "?")
-        if ptype == "text":
-            text = part.get("text", "").strip()
-            if text:
-                print(f"  [{role}] {truncate_text(text, limit=300)}")
-        elif ptype == "reasoning":
-            text = part.get("text", "").strip()
-            if text:
-                print(f"  [{role}] reasoning: {truncate_text(text, limit=220)}")
-        elif ptype == "tool":
-            name = part.get("tool", "?")
-            state = part.get("state", {})
-            status = state.get("status", "?")
-            summary = summarize_tool_input(name, state.get("input", {}))
-            output = state.get("output") or state.get("metadata", {}).get("output") or ""
-            output_str = truncate_text(str(output), limit=200) if output else ""
-            print(f"  [{role}] {name} ({status})")
-            if summary:
-                print(f"         input: {summary}")
-            if output_str and status == "completed":
-                print(f"         -> {output_str}")
-        elif ptype == "tool_use":
-            name = part.get("name", "?")
-            status = part.get("status", "?")
-            summary = summarize_tool_input(name, part.get("input", {}))
-            print(f"  [{role}] {name} ({status})")
-            if summary:
-                print(f"         input: {summary}")
-        elif ptype == "tool_result":
-            content = str(part.get("content", ""))
-            if content:
-                print(f"         -> {truncate_text(content, limit=200)}")
-        elif ptype == "patch":
-            files = part.get("files", [])
-            names: list[str] = []
-            for f in files:
-                if isinstance(f, str):
-                    names.append(f)
-                elif isinstance(f, dict):
-                    name = f.get("path") or f.get("filename") or f.get("name") or "?"
-                    names.append(str(name))
-            print(f"  [{role}] patch: {', '.join(names)} ({len(names)} files)")
-        elif isinstance(ptype, str) and (ptype.endswith("-start") or ptype.endswith("-finish")):
-            pass  # skip noise
-        else:
-            print(f"  [{role}] {ptype}")
-
-
-def extract_envoi_calls(message_parts: list[dict[str, Any]]) -> list[EnvoiCall]:
-    """Extract envoi test calls from message parts."""
-    calls: list[EnvoiCall] = []
-
-    # Handle tool_use + tool_result pairs (older format)
-    tool_results: dict[str, dict[str, Any]] = {}
-    for part in message_parts:
-        if part.get("type") == "tool_result":
-            tool_results[part.get("tool_use_id", "")] = part
-    for part in message_parts:
-        if part.get("type") == "tool_use" and part.get("name") == "run_tests":
-            tool_result = tool_results.get(part.get("id", ""))
-            if tool_result:
-                content = tool_result.get("content", "")
-                parsed_call = parse_envoi_call_payload(content)
-                if parsed_call is not None:
-                    calls.append(parsed_call)
-        # Handle "tool" type parts (OpenCode's actual format)
-        if part.get("type") == "tool" and part.get("tool") == "run_tests":
-            state = part.get("state", {})
-            if state.get("status") == "completed":
-                output = state.get("output") or state.get("metadata", {}).get("output") or ""
-                parsed_call = parse_envoi_call_payload(output)
-                if parsed_call is not None:
-                    calls.append(parsed_call)
-    return calls
-
-
-def parse_envoi_call_payload(value: Any) -> EnvoiCall | None:
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            return None
-        return parse_envoi_call_payload(parsed)
-
-    if isinstance(value, dict):
-        if "path" in value and "timestamp" in value:
-            try:
-                return EnvoiCall(**value)
-            except Exception:
-                pass
-        for nested_key in ("result", "data", "output", "structured_content"):
-            if nested_key in value:
-                parsed_nested = parse_envoi_call_payload(value.get(nested_key))
-                if parsed_nested is not None:
-                    return parsed_nested
-    return None
-
-
-def count_meaningful_parts(messages: list[dict[str, Any]]) -> int:
-    """Count meaningful assistant parts from newly observed messages."""
-    count = 0
-    for message in messages:
-        info = message.get("info", {})
-        role = info.get("role")
-        if role != "assistant":
-            continue
-        parts = message.get("parts", [])
-        if not isinstance(parts, list):
-            continue
-        for part in parts:
-            if isinstance(part, dict) and part.get("type") in MEANINGFUL_PART_TYPES:
-                count += 1
-    return count
-
-
-# ---------------------------------------------------------------------------
-# S3 helpers
-# ---------------------------------------------------------------------------
-
-_s3_client = None
-
-
-def get_s3_client():
-    global _s3_client
-    if _s3_client is None:
-        _s3_client = boto3.client(
-            "s3",
-            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-            region_name=os.environ.get("AWS_REGION", "us-east-1"),
-        )
-    return _s3_client
-
-
-def get_bucket() -> str:
-    return os.environ.get("AWS_S3_BUCKET", "envoi-trace-data")
-
-
-def save_trace_parquet(
-    trajectory_id: str,
-    trace: AgentTrace,
-    env_config: EnvConfig,
-    *,
-    allow_empty: bool = False,
-) -> None:
-    part_count = len(trace.parts)
-    turn_count = len(trace.turns)
-    if not allow_empty and turn_count == 0 and part_count == 0:
-        return
-
-    suites: dict[str, Any] = {}
-    for eval_rec in trace.evaluations.values():
-        if eval_rec.suite_results:
-            suites = eval_rec.suite_results
-
-    rows = agent_trace_to_rows(
-        trace,
-        environment=env_config.environment,
-        task_params=env_config.params,
-        suites=suites,
-        bundle_uri=artifact_uri(trajectory_id, "repo.bundle"),
-    )
-    buf = io.BytesIO()
-    write_trace_parquet(rows, buf)
-    upload_file(trajectory_id, "trace.parquet", buf.getvalue())
-    print(f"[s3] saved trace.parquet (parts={part_count})")
-
-
-def upload_file(trajectory_id: str, filename: str, data: bytes) -> str:
-    s3 = get_s3_client()
-    bucket = get_bucket()
-    key = f"trajectories/{trajectory_id}/{filename}"
-    s3.put_object(Bucket=bucket, Key=key, Body=data)
-    return f"s3://{bucket}/{key}"
-
-
-def artifact_uri(trajectory_id: str, filename: str) -> str:
-    bucket = get_bucket()
-    key = f"trajectories/{trajectory_id}/{filename}"
-    return f"s3://{bucket}/{key}"
-
-
-def load_trace_snapshot(trajectory_id: str) -> AgentTrace | None:
-    s3 = get_s3_client()
-    bucket = get_bucket()
-    key = f"trajectories/{trajectory_id}/trace.parquet"
-    try:
-        response = s3.get_object(Bucket=bucket, Key=key)
-    except Exception as error:  # noqa: BLE001
-        code = str(
-            getattr(error, "response", {}).get("Error", {}).get("Code", "")
-        ).strip()
-        if code in {"NoSuchKey", "404", "NotFound"}:
-            return None
-        print(f"[resume] failed to load prior trace: {error}")
-        return None
-
-    raw_body = response.get("Body")
-    if raw_body is None:
-        return None
-    try:
-        buf = io.BytesIO(raw_body.read())
-        trace_dict = parquet_to_trace_dict(buf)
-    except Exception as error:  # noqa: BLE001
-        print(f"[resume] failed to read parquet trace: {error}")
-        return None
-
-    try:
-        return AgentTrace.model_validate(trace_dict)
-    except Exception as error:  # noqa: BLE001
-        print(f"[resume] failed to parse trace schema: {error}")
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -699,482 +222,6 @@ async def dump_sandbox_logs(
                     builtins.print(f"  {line}", flush=True)
         except Exception:
             pass
-
-
-def environment_upload_items(
-    py_files: dict[str, str] | None = None,
-    c_files: dict[str, str] | None = None,
-    txt_files: dict[str, str] | None = None,
-) -> list[tuple[str, str]]:
-    env_py = py_files if py_files is not None else _ENV_PY
-    env_c = c_files if c_files is not None else _ENV_C
-    env_txt = txt_files if txt_files is not None else _ENV_TXT
-    items: list[tuple[str, str]] = []
-    for rel, content in env_py.items():
-        items.append((f"/environment/{rel}", content))
-    for rel, content in env_c.items():
-        items.append((f"/environment/{rel}", content))
-    for rel, content in env_txt.items():
-        items.append((f"/environment/{rel}", content))
-    return items
-
-
-async def upload_files_parallel(
-    sb: SandboxBackend,
-    uploads: list[tuple[str, str]],
-    *,
-    concurrency: int = SETUP_UPLOAD_CONCURRENCY,
-    log_upload: bool = True,
-) -> None:
-    if not uploads:
-        return
-
-    bounded = max(1, concurrency)
-    dirs = sorted({str(Path(path).parent) for path, _ in uploads})
-    if dirs:
-        mkdir_cmd = "mkdir -p " + " ".join(shlex.quote(d) for d in dirs)
-        await sb.run(mkdir_cmd, quiet=True)
-
-    print(
-        f"[setup] uploading {len(uploads)} files with concurrency={bounded}"
-    )
-
-    semaphore = asyncio.Semaphore(bounded)
-
-    async def _upload(path: str, content: str) -> None:
-        if log_upload:
-            print(f"[setup][upload] {path}")
-        async with semaphore:
-            await sb.write_file(
-                path,
-                content,
-                ensure_dir=False,
-                log_upload=False,
-            )
-
-    await asyncio.gather(*[_upload(path, content) for path, content in uploads])
-
-
-async def run_git_command_with_retry(
-    sb: SandboxBackend,
-    cmd: str,
-    *,
-    attempts: int = GIT_RETRY_ATTEMPTS,
-    timeout: int = 60,
-    cwd: str | None = None,
-) -> tuple[int, str, str]:
-    last: tuple[int, str, str] = (1, "", "")
-    for attempt in range(1, max(1, attempts) + 1):
-        exit_code, stdout, stderr = (await sb.run(
-            cmd,
-            timeout=timeout,
-            quiet=True,
-            cwd=cwd,
-        )).unpack()
-        last = (exit_code, stdout, stderr)
-        if exit_code == 0:
-            return last
-
-        stderr_text = (stderr or "").lower()
-        retryable = (
-            exit_code == 128
-            or "index.lock" in stderr_text
-            or "unable to create" in stderr_text
-            or "another git process" in stderr_text
-        )
-        if not retryable or attempt >= max(1, attempts):
-            return last
-
-        delay_seconds = GIT_RETRY_BACKOFF_SECONDS * attempt
-        print(
-            f"[git] transient failure exit={exit_code} attempt={attempt}/{attempts}; "
-            f"retrying in {delay_seconds:.1f}s"
-        )
-        await asyncio.sleep(delay_seconds)
-
-    return last
-
-
-async def get_git_commit(sb: SandboxBackend) -> str | None:
-    _, stdout, _ = await run_git_command_with_retry(
-        sb,
-        "git rev-parse HEAD 2>/dev/null || echo none",
-        cwd="/workspace",
-    )
-    commit = stdout.strip()
-    return commit if commit and commit != "none" else None
-
-
-async def get_changed_files(sb: SandboxBackend) -> list[str]:
-    exit_code, stdout, stderr = await run_git_command_with_retry(
-        sb,
-        "git status --porcelain",
-        cwd="/workspace",
-    )
-    if exit_code != 0:
-        print(
-            f"[git] unable to read working tree state after retries: "
-            f"{truncate_text(stderr or '(no stderr)', limit=300)}"
-        )
-        return []
-    files: list[str] = []
-    for line in stdout.splitlines():
-        if not line.strip():
-            continue
-        entry = line[3:].strip() if len(line) >= 4 else line.strip()
-        if " -> " in entry:
-            entry = entry.split(" -> ", 1)[1]
-        if entry:
-            files.append(entry)
-    return files
-
-
-def parse_numstat_output(stdout: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for line in stdout.splitlines():
-        if not line.strip():
-            continue
-        columns = line.split("\t")
-        if len(columns) < 3:
-            continue
-        added_raw, deleted_raw, path = columns[0], columns[1], columns[2]
-        added = int(added_raw) if added_raw.isdigit() else None
-        deleted = int(deleted_raw) if deleted_raw.isdigit() else None
-        rows.append(
-            {
-                "path": path,
-                "added": added,
-                "deleted": deleted,
-            }
-        )
-    return rows
-
-
-async def get_commit_patch_payload(
-    sb: SandboxBackend,
-    commit: str,
-) -> tuple[str | None, str | None, list[dict[str, Any]]]:
-    quoted_commit = shlex.quote(commit)
-    patch_text: str | None = None
-    stats_text: str | None = None
-    numstat_rows: list[dict[str, Any]] = []
-
-    patch_exit, patch_stdout, _ = (await sb.run(
-        f"git show --format= --no-color --patch {quoted_commit}",
-        quiet=True,
-        cwd="/workspace",
-    )).unpack()
-    if patch_exit == 0:
-        patch_text = patch_stdout
-
-    stats_exit, stats_stdout, _ = (await sb.run(
-        f"git show --format= --no-color --stat {quoted_commit}",
-        quiet=True,
-        cwd="/workspace",
-    )).unpack()
-    if stats_exit == 0:
-        stats_text = stats_stdout
-
-    numstat_exit, numstat_stdout, _ = (await sb.run(
-        f"git show --format= --no-color --numstat {quoted_commit}",
-        quiet=True,
-        cwd="/workspace",
-    )).unpack()
-    if numstat_exit == 0:
-        numstat_rows = parse_numstat_output(numstat_stdout)
-
-    return patch_text, stats_text, numstat_rows
-
-
-async def upload_repo_bundle_snapshot(
-    *,
-    sb: SandboxBackend,
-    trajectory_id: str,
-    reason: str,
-) -> str | None:
-    if not INCREMENTAL_BUNDLE_UPLOAD:
-        return None
-
-    exit_code, _, stderr = await run_git_command_with_retry(
-        sb,
-        "git bundle create /tmp/repo.bundle --all",
-        attempts=2,
-        cwd="/workspace",
-    )
-    if exit_code != 0:
-        print(
-            "[bundle] snapshot create failed: "
-            f"{truncate_text(stderr or '(no stderr)', limit=240)}"
-        )
-        return None
-
-    _, size_out, _ = (await sb.run(
-        "stat -c %s /tmp/repo.bundle 2>/dev/null || echo 0",
-        quiet=True,
-    )).unpack()
-    bundle_size = int(size_out.strip() or "0")
-    if bundle_size <= 0:
-        return None
-
-    b64_exit, b64, b64_stderr = (await sb.run(
-        "base64 /tmp/repo.bundle",
-        quiet=True,
-    )).unpack()
-    if b64_exit != 0:
-        print(
-            "[bundle] snapshot encode failed: "
-            f"{truncate_text(b64_stderr or '(no stderr)', limit=240)}"
-        )
-        return None
-
-    data = base64.b64decode(b64.strip())
-    uri = upload_file(trajectory_id, "repo.bundle", data)
-    print(f"[bundle] snapshot uploaded ({len(data)} bytes) reason={reason}")
-    return uri
-
-
-async def create_part_checkpoint(
-    sb: SandboxBackend,
-    trajectory_id: str,
-    part: int,
-    changed_files_hint: list[str] | None = None,
-    commit_before_hint: str | None = None,
-) -> RepoCheckpoint:
-    commit_before = (
-        commit_before_hint
-        if commit_before_hint is not None
-        else await get_git_commit(sb)
-    )
-    changed_files = (
-        [f for f in changed_files_hint if isinstance(f, str) and f]
-        if changed_files_hint is not None
-        else await get_changed_files(sb)
-    )
-    if not changed_files:
-        return RepoCheckpoint(
-            commit_before=commit_before,
-            commit_after=commit_before,
-            committed=False,
-            changed_files=[],
-        )
-
-    # Re-read actual dirty state so hints from streamed events never cause
-    # a spurious commit attempt when git is already clean.
-    actual_changed_files = await get_changed_files(sb)
-    if not actual_changed_files:
-        return RepoCheckpoint(
-            commit_before=commit_before,
-            commit_after=commit_before,
-            committed=False,
-            changed_files=changed_files,
-        )
-    changed_files = actual_changed_files
-
-    commit_message = f"part {part} checkpoint"
-    exit_code, _, stderr = await run_git_command_with_retry(
-        sb,
-        "git add -A && "
-        f"git commit -m {shlex.quote(commit_message)}",
-        attempts=GIT_RETRY_ATTEMPTS,
-        cwd="/workspace",
-    )
-    if exit_code != 0:
-        print(f"[git] checkpoint commit failed on part {part}: {truncate_text(stderr, limit=400)}")
-        return RepoCheckpoint(
-            commit_before=commit_before,
-            commit_after=commit_before,
-            committed=False,
-            changed_files=changed_files,
-        )
-
-    commit_after = await get_git_commit(sb)
-    patch_text: str | None = None
-    stats_text: str | None = None
-    numstat_rows: list[dict[str, Any]] = []
-    if commit_after:
-        patch_text, stats_text, numstat_rows = await get_commit_patch_payload(
-            sb,
-            commit_after,
-        )
-        await upload_repo_bundle_snapshot(
-            sb=sb,
-            trajectory_id=trajectory_id,
-            reason=f"part {part}",
-        )
-
-    print(f"[git] committed part {part}: {commit_after} files={len(changed_files)}")
-    return RepoCheckpoint(
-        commit_before=commit_before,
-        commit_after=commit_after,
-        committed=True,
-        changed_files=changed_files,
-        patch=patch_text,
-        stats=stats_text,
-        numstat=numstat_rows,
-    )
-
-
-def _extract_leaf_paths(schema: Any) -> list[str]:
-    """Walk an envoi /schema tree and collect all leaf test paths."""
-    leaves: list[str] = []
-
-    def _walk(node: Any, prefix: str) -> None:
-        if isinstance(node, dict):
-            children = node.get("children") or node.get("suites")
-            if isinstance(children, dict):
-                for key, child in children.items():
-                    _walk(child, f"{prefix}/{key}" if prefix else key)
-                return
-        # Leaf node
-        if prefix:
-            leaves.append(prefix)
-
-    _walk(schema, "")
-    return sorted(leaves) if leaves else []
-
-
-def _extract_suite_roots(schema: Any) -> list[str]:
-    """Extract top-level suite names from an envoi /schema tree."""
-    if isinstance(schema, dict):
-        children = schema.get("children") or schema.get("suites")
-        if isinstance(children, dict):
-            return sorted(children.keys())
-    return []
-
-
-def build_commit_evaluation_command(
-    *,
-    commit: str,
-    eval_repo_dir: str,
-    suite_paths: list[str] | None = None,
-) -> str:
-    suite_paths_json = json.dumps(
-        suite_paths if suite_paths is not None
-        else list(_default_env.suite_paths)
-    )
-    repo_dir_json = json.dumps(eval_repo_dir)
-    envoi_url_json = json.dumps(EVALUATION_ENVOI_URL)
-    marker_json = json.dumps(EVALUATION_JSON_MARKER)
-    quoted_commit = shlex.quote(commit)
-    quoted_repo_dir = shlex.quote(eval_repo_dir)
-    return (
-        "set -euo pipefail\n"
-        f"repo_dir={quoted_repo_dir}\n"
-        "rm -rf \"$repo_dir\"\n"
-        "git clone -q /workspace \"$repo_dir\"\n"
-        "cd \"$repo_dir\"\n"
-        f"git checkout -q {quoted_commit}\n"
-        "python3 - <<'PY'\n"
-        "import asyncio\n"
-        "import json\n"
-        "import time\n"
-        "import traceback\n"
-        "import envoi\n"
-        f"repo_dir = {repo_dir_json}\n"
-        f"suite_paths = {suite_paths_json}\n"
-        f"envoi_url = {envoi_url_json}\n"
-        f"marker = {marker_json}\n"
-        "async def _main() -> None:\n"
-        "    started_at = time.monotonic()\n"
-        "    payload = {\n"
-        "        'duration_ms': 0,\n"
-        "        'passed': 0,\n"
-        "        'failed': 0,\n"
-        "        'total': 0,\n"
-        "        'suite_results': {},\n"
-        "        'error': None,\n"
-        "    }\n"
-        "    try:\n"
-        "        docs = envoi.Documents(repo_dir)\n"
-        "        async with await envoi.connect_session(\n"
-        "            envoi_url,\n"
-        "            submission=docs,\n"
-        "            session_timeout_seconds=7200,\n"
-        "        ) as session:\n"
-        "            for suite_path in suite_paths:\n"
-        "                suite_payload = {\n"
-        "                    'ok': False,\n"
-        "                    'passed': 0,\n"
-        "                    'failed': 0,\n"
-        "                    'total': 0,\n"
-        "                    'error': None,\n"
-        "                    'result': None,\n"
-        "                }\n"
-        "                try:\n"
-        "                    result = await session.test(suite_path)\n"
-        "                    suite_payload['result'] = result\n"
-        "                    if isinstance(result, dict):\n"
-        "                        suite_payload['passed'] = int(result.get('passed', 0) or 0)\n"
-        "                        suite_payload['failed'] = int(result.get('failed', 0) or 0)\n"
-        "                        suite_payload['total'] = int(result.get('total', 0) or 0)\n"
-        "                        suite_payload['ok'] = (\n"
-        "                            suite_payload['failed'] == 0 and suite_payload['total'] > 0\n"
-        "                        )\n"
-        "                    else:\n"
-        "                        suite_payload['error'] = (\n"
-        "                            f'Unexpected result type: {type(result).__name__}'\n"
-        "                        )\n"
-        "                except Exception as suite_error:  # noqa: BLE001\n"
-        "                    suite_payload['error'] = str(suite_error)\n"
-        "                    suite_payload['traceback'] = traceback.format_exc()\n"
-        "                payload['suite_results'][suite_path] = suite_payload\n"
-        "                payload['passed'] += int(suite_payload.get('passed', 0) or 0)\n"
-        "                payload['failed'] += int(suite_payload.get('failed', 0) or 0)\n"
-        "                payload['total'] += int(suite_payload.get('total', 0) or 0)\n"
-        "    except Exception as error:  # noqa: BLE001\n"
-        "        payload['error'] = str(error)\n"
-        "        payload['traceback'] = traceback.format_exc()\n"
-        "    finally:\n"
-        "        payload['duration_ms'] = int((time.monotonic() - started_at) * 1000)\n"
-        "    print(marker + json.dumps(payload, ensure_ascii=False))\n"
-        "asyncio.run(_main())\n"
-        "PY\n"
-        "status=$?\n"
-        "cd /workspace\n"
-        "rm -rf \"$repo_dir\"\n"
-        "exit $status\n"
-    )
-
-
-def parse_commit_evaluation_payload(stdout: str) -> dict[str, Any] | None:
-    for line in reversed(stdout.splitlines()):
-        if not line.startswith(EVALUATION_JSON_MARKER):
-            continue
-        raw_json = line[len(EVALUATION_JSON_MARKER) :].strip()
-        if not raw_json:
-            continue
-        try:
-            parsed = json.loads(raw_json)
-        except Exception:
-            return None
-        return parsed if isinstance(parsed, dict) else None
-    return None
-
-
-async def run_commit_evaluation(
-    *,
-    sb: SandboxBackend,
-    commit: str,
-    suite_paths: list[str] | None = None,
-) -> dict[str, Any]:
-    eval_repo_dir = f"/tmp/envoi-eval-{commit[:12]}-{uuid.uuid4().hex[:8]}"
-    command = build_commit_evaluation_command(
-        commit=commit, eval_repo_dir=eval_repo_dir,
-        suite_paths=suite_paths,
-    )
-    exit_code, stdout, stderr = (await sb.run(
-        command,
-        timeout=EVALUATION_TIMEOUT_SECONDS,
-        quiet=True,
-    )).unpack()
-    payload = parse_commit_evaluation_payload(stdout)
-    return {
-        "command": command,
-        "exit_code": exit_code,
-        "stdout": stdout,
-        "stderr": stderr,
-        "payload": payload,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -1402,722 +449,6 @@ async def setup_sandbox_codex(
 
 
 # ---------------------------------------------------------------------------
-# Sandbox client helpers (shared between opencode + codex)
-# ---------------------------------------------------------------------------
-
-
-async def run_sandbox_client(
-    sb: SandboxBackend,
-    script_path: str,
-    label: str,
-    args: list[str],
-    *,
-    timeout: int = 60,
-    quiet: bool = False,
-    stream_output: bool = False,
-    on_stderr_line: Callable[[str], Awaitable[None]] | None = None,
-) -> dict[str, Any] | None:
-    """Run a sandbox client script and return parsed JSON stdout."""
-    command = (
-        f"python3 -u {shlex.quote(script_path)} "
-        + " ".join(shlex.quote(a) for a in args)
-    )
-    exit_code, stdout, stderr = (await sb.run(
-        command,
-        timeout=timeout,
-        quiet=quiet,
-        stream_output=stream_output,
-        on_stderr_line=on_stderr_line,
-    )).unpack()
-    if exit_code != 0:
-        if stderr:
-            builtins.print(
-                f"[{label}] command failed: {stderr[:500]}", flush=True,
-            )
-        return None
-
-    try:
-        return json.loads(stdout)
-    except json.JSONDecodeError:
-        stdout_preview = stdout[:500] + "...[truncated]" if len(stdout) > 500 else stdout
-        builtins.print(
-            f"[{label}] invalid JSON response: {stdout_preview}",
-            flush=True,
-        )
-        return None
-
-
-async def parse_trace_event_line(
-    line: str,
-    on_stream_part: Callable[[dict[str, Any]], Awaitable[None]] | None,
-) -> None:
-    """Parse a TRACE_EVENT from a stderr line and forward to callback."""
-    if on_stream_part is None:
-        return
-    stripped = line.strip()
-    if not stripped.startswith(TRACE_EVENT_PREFIX):
-        return
-    payload = stripped[len(TRACE_EVENT_PREFIX):].strip()
-    if not payload:
-        return
-    try:
-        event_obj = json.loads(payload)
-    except json.JSONDecodeError:
-        return
-    if isinstance(event_obj, dict):
-        await on_stream_part(event_obj)
-
-
-def agent_message_id(message: dict[str, Any]) -> str | None:
-    """Extract the message id from a message dict."""
-    info = message.get("info", {})
-    message_id_value = info.get("id")
-    if isinstance(message_id_value, str) and message_id_value:
-        return message_id_value
-    return None
-
-
-# ---------------------------------------------------------------------------
-# OpenCode agent functions
-# ---------------------------------------------------------------------------
-
-_OPENCODE_SCRIPT_PATH = "/sandbox/opencode_client.py"
-_OPENCODE_LABEL = "opencode-sdk"
-
-
-async def _run_opencode_client(
-    sb: SandboxBackend,
-    args: list[str],
-    *,
-    timeout: int = 60,
-    quiet: bool = False,
-    stream_output: bool = False,
-    on_stderr_line: Callable[[str], Awaitable[None]] | None = None,
-) -> dict[str, Any] | None:
-    return await run_sandbox_client(
-        sb, _OPENCODE_SCRIPT_PATH, _OPENCODE_LABEL, args,
-        timeout=timeout, quiet=quiet,
-        stream_output=stream_output, on_stderr_line=on_stderr_line,
-    )
-
-
-async def opencode_create_session(sb: SandboxBackend, title: str) -> str | None:
-    response = await _run_opencode_client(
-        sb, ["create-session", "--title", title], timeout=60,
-    )
-    if response is None:
-        return None
-    if not response.get("ok"):
-        builtins.print(
-            f"[session] create failed: {response.get('error')}", flush=True,
-        )
-        return None
-    body = response.get("body", {})
-    session_id = body.get("id") if isinstance(body, dict) else None
-    builtins.print(f"[session] created id={session_id}", flush=True)
-    return session_id
-
-
-async def opencode_ensure_provider_connected(
-    sb: SandboxBackend, api_key: str,
-) -> None:
-    response = await _run_opencode_client(
-        sb, ["provider-status"], timeout=30, quiet=True,
-    )
-    if (
-        response
-        and response.get("ok")
-        and isinstance(response.get("body"), dict)
-    ):
-        connected = response["body"].get("connected", [])
-        builtins.print(f"[provider] connected={connected}", flush=True)
-        if isinstance(connected, list) and "opencode" in connected:
-            return
-
-    builtins.print(
-        "[provider] opencode not connected, setting auth...", flush=True,
-    )
-    api_key_path = "/tmp/auth_opencode_api_key.txt"
-    await sb.write_file(api_key_path, api_key, ensure_dir=False)
-    auth_response = await _run_opencode_client(
-        sb, ["provider-auth", "--api-key-file", api_key_path], timeout=30,
-    )
-    if auth_response is None or not auth_response.get("ok"):
-        raise RuntimeError(
-            f"Failed to authenticate provider: {auth_response}",
-        )
-
-
-async def opencode_get_all_messages(
-    sb: SandboxBackend, session_id: str,
-) -> list[dict[str, Any]]:
-    response = await _run_opencode_client(
-        sb, ["list-messages", "--session-id", session_id],
-        timeout=60, quiet=True,
-    )
-    if response is None or not response.get("ok"):
-        return []
-    body = response.get("body")
-    if isinstance(body, list):
-        return body
-    if isinstance(body, dict):
-        for key in ("items", "messages", "data", "results"):
-            value = body.get(key)
-            if isinstance(value, list):
-                return value
-    return []
-
-
-async def opencode_get_all_sessions(sb: SandboxBackend) -> list[dict[str, Any]]:
-    response = await _run_opencode_client(
-        sb, ["list-sessions"], timeout=60, quiet=True,
-    )
-    if response is None or not response.get("ok"):
-        return []
-    body = response.get("body")
-    if isinstance(body, list):
-        return body
-    if isinstance(body, dict):
-        for key in ("items", "sessions", "data", "results"):
-            value = body.get(key)
-            if isinstance(value, list):
-                return value
-    return []
-
-
-def _session_object_id(session: dict[str, Any]) -> str | None:
-    for key in ("id", "sessionID", "session_id"):
-        value = session.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
-
-
-def _session_object_parent_id(session: dict[str, Any]) -> str | None:
-    for key in ("parentID", "parent_id", "parentId"):
-        value = session.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return None
-
-
-def _get_session_family(
-    root_session_id: str, sessions: list[dict[str, Any]],
-) -> list[str]:
-    known_ids = {
-        sid
-        for s in sessions
-        if isinstance(s, dict)
-        if (sid := _session_object_id(s))
-    }
-    if root_session_id not in known_ids:
-        return [root_session_id]
-
-    children_by_parent: dict[str, list[str]] = {}
-    for s in sessions:
-        if not isinstance(s, dict):
-            continue
-        sid = _session_object_id(s)
-        parent_id = _session_object_parent_id(s)
-        if sid and parent_id:
-            children_by_parent.setdefault(parent_id, []).append(sid)
-
-    family: list[str] = []
-    queue = [root_session_id]
-    seen: set[str] = set()
-    while queue:
-        current = queue.pop(0)
-        if current in seen:
-            continue
-        seen.add(current)
-        family.append(current)
-        queue.extend(children_by_parent.get(current, []))
-    return family
-
-
-def _message_created_ms(message: dict[str, Any]) -> int:
-    info = message.get("info", {})
-    time_info = info.get("time", {})
-    created = time_info.get("created")
-    return int(created) if isinstance(created, int) else 0
-
-
-async def opencode_collect_turn_messages(
-    sb: SandboxBackend,
-    root_session_id: str,
-    seen_message_ids: set[str],
-) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
-    sessions = await opencode_get_all_sessions(sb)
-    session_ids = _get_session_family(root_session_id, sessions)
-    session_map: dict[str, dict[str, Any]] = {}
-    for s in sessions:
-        if not isinstance(s, dict):
-            continue
-        sid = _session_object_id(s)
-        if sid and sid in session_ids:
-            session_map[sid] = s
-
-    message_results = await asyncio.gather(
-        *[opencode_get_all_messages(sb, sid) for sid in session_ids],
-    )
-
-    all_messages: list[dict[str, Any]] = []
-    for sid, messages in zip(session_ids, message_results, strict=False):
-        for message in messages:
-            if not isinstance(message, dict):
-                continue
-            info = message.setdefault("info", {})
-            if "sessionID" not in info:
-                info["sessionID"] = sid
-            all_messages.append(message)
-
-    all_messages.sort(key=_message_created_ms)
-
-    new_messages: list[dict[str, Any]] = []
-    for message in all_messages:
-        mid = agent_message_id(message)
-        if mid and mid in seen_message_ids:
-            continue
-        if mid:
-            seen_message_ids.add(mid)
-        new_messages.append(message)
-
-    session_objects = [
-        session_map[sid] for sid in session_ids if sid in session_map
-    ]
-    return session_objects, session_ids, new_messages
-
-
-async def _opencode_send_message_blocking(
-    sb: SandboxBackend,
-    session_id: str,
-    text: str,
-    timeout: int,
-    remaining_parts_budget: int,
-    on_stream_part: Callable[[dict[str, Any]], Awaitable[None]] | None,
-) -> dict[str, Any] | None:
-    prompt_path = "/tmp/prompt.txt"
-    await sb.write_file(prompt_path, text, ensure_dir=False)
-    builtins.print(
-        f"[prompt] sending message ({len(text)} chars), "
-        f"waiting up to {timeout}s...",
-        flush=True,
-    )
-
-    async def handle_stderr_line(line: str) -> None:
-        await parse_trace_event_line(line, on_stream_part)
-
-    response = await _run_opencode_client(
-        sb,
-        [
-            "chat-stream",
-            "--session-id", session_id,
-            "--text-file", prompt_path,
-            "--max-parts", str(remaining_parts_budget),
-        ],
-        timeout=timeout,
-        stream_output=True,
-        on_stderr_line=handle_stderr_line,
-    )
-    if response is None:
-        return None
-
-    status_code = response.get("status_code")
-    ok = bool(response.get("ok"))
-    body = response.get("body")
-    meta = response.get("meta")
-    meta_obj = meta if isinstance(meta, dict) else {}
-    aborted_for_part_limit = bool(meta_obj.get("aborted_for_part_limit"))
-    builtins.print(f"[prompt] done http={status_code} ok={ok}", flush=True)
-
-    if not ok:
-        if aborted_for_part_limit:
-            builtins.print(
-                "[prompt] part limit reached during stream; "
-                "ending current turn",
-                flush=True,
-            )
-            if isinstance(body, dict):
-                stream_meta = body.get("_stream")
-                stream_obj = (
-                    stream_meta if isinstance(stream_meta, dict) else {}
-                )
-                stream_obj.update(meta_obj)
-                body["_stream"] = stream_obj
-                return body
-            return {"_stream": dict(meta_obj)}
-        error_text = str(response.get("error") or body)
-        if len(error_text) > 1000:
-            error_text = error_text[:1000] + "...[truncated]"
-        builtins.print(f"[prompt] ERROR: {error_text}", flush=True)
-        return None
-
-    if not isinstance(body, dict):
-        if aborted_for_part_limit:
-            return {"_stream": dict(meta_obj)}
-        builtins.print(
-            f"[prompt] unexpected response type: {type(body).__name__}",
-            flush=True,
-        )
-        return None
-
-    stream_meta = body.get("_stream")
-    stream_obj = stream_meta if isinstance(stream_meta, dict) else {}
-    stream_obj.update(meta_obj)
-    body["_stream"] = stream_obj
-    return body
-
-
-async def opencode_run_turn(
-    sb: SandboxBackend,
-    session_id: str,
-    model: str,
-    prompt_text: str,
-    seen_message_ids: set[str],
-    timeout: int,
-    remaining_parts_budget: int,
-    on_stream_part: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-) -> AgentTurnOutcome | None:
-    response = await _opencode_send_message_blocking(
-        sb, session_id, prompt_text,
-        timeout=timeout,
-        remaining_parts_budget=remaining_parts_budget,
-        on_stream_part=on_stream_part,
-    )
-    if response is None:
-        return None
-    session_objects, session_ids, new_messages = (
-        await opencode_collect_turn_messages(
-            sb, session_id, seen_message_ids,
-        )
-    )
-    return AgentTurnOutcome(
-        session_id=session_id,
-        response=response,
-        session_objects=session_objects,
-        session_ids=session_ids,
-        new_messages=new_messages,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Codex agent functions
-# ---------------------------------------------------------------------------
-
-_CODEX_SCRIPT_PATH = "/sandbox/codex_client.py"
-_CODEX_LABEL = "codex-cli"
-
-
-async def _run_codex_client(
-    sb: SandboxBackend,
-    args: list[str],
-    *,
-    timeout: int = 60,
-    quiet: bool = False,
-    stream_output: bool = False,
-    on_stderr_line: Callable[[str], Awaitable[None]] | None = None,
-) -> dict[str, Any] | None:
-    return await run_sandbox_client(
-        sb, _CODEX_SCRIPT_PATH, _CODEX_LABEL, args,
-        timeout=timeout, quiet=quiet,
-        stream_output=stream_output, on_stderr_line=on_stderr_line,
-    )
-
-
-async def codex_run_turn(
-    sb: SandboxBackend,
-    session_id: str,
-    model: str,
-    prompt_text: str,
-    seen_message_ids: set[str],
-    timeout: int,
-    remaining_parts_budget: int,
-    on_stream_part: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-    api_key_file: str | None = None,
-) -> AgentTurnOutcome | None:
-    prompt_path = "/tmp/prompt.txt"
-    await sb.write_file(prompt_path, prompt_text, ensure_dir=False)
-    args = [
-        "chat-stream",
-        "--session-id", session_id,
-        "--text-file", prompt_path,
-        "--model", model,
-        "--max-parts", str(remaining_parts_budget),
-    ]
-    if api_key_file:
-        args.extend(["--api-key-file", api_key_file])
-
-    async def handle_stderr_line(line: str) -> None:
-        await parse_trace_event_line(line, on_stream_part)
-
-    response = await _run_codex_client(
-        sb, args,
-        timeout=timeout,
-        stream_output=True,
-        on_stderr_line=handle_stderr_line,
-    )
-    if response is None:
-        return None
-    if not response.get("ok"):
-        error_text = str(response.get("error"))
-        if len(error_text) > 800:
-            error_text = error_text[:800] + "...[truncated]"
-        builtins.print(
-            f"[codex] turn failed: {error_text}", flush=True,
-        )
-        return None
-    body = response.get("body")
-    if not isinstance(body, dict):
-        builtins.print("[codex] missing body in response", flush=True)
-        return None
-
-    updated_session_id = body.get("_session_id")
-    effective_session_id = (
-        updated_session_id
-        if isinstance(updated_session_id, str) and updated_session_id
-        else session_id
-    )
-
-    message_obj = body.get("_message")
-    new_messages: list[dict[str, Any]] = []
-    if isinstance(message_obj, dict):
-        mid = agent_message_id(message_obj)
-        if mid and mid in seen_message_ids:
-            pass
-        else:
-            if mid:
-                seen_message_ids.add(mid)
-            new_messages.append(message_obj)
-    if not new_messages:
-        fallback_msg = {
-            "info": {
-                "id": f"{effective_session_id}:{int(time.time() * 1000)}",
-                "role": "assistant",
-                "sessionID": effective_session_id,
-                "time": {"created": int(time.time() * 1000)},
-            },
-            "parts": body.get("parts", []),
-        }
-        fallback_mid = agent_message_id(fallback_msg)
-        if fallback_mid:
-            seen_message_ids.add(fallback_mid)
-        new_messages.append(fallback_msg)
-
-    session_obj = {"id": effective_session_id, "provider": "codex"}
-    return AgentTurnOutcome(
-        session_id=effective_session_id,
-        response=body,
-        session_objects=[session_obj],
-        session_ids=[effective_session_id],
-        new_messages=new_messages,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Stream callback
-# ---------------------------------------------------------------------------
-
-
-def make_stream_part_callback(
-    *,
-    sb: SandboxBackend,
-    trajectory_id: str,
-    agent_trace: AgentTrace,
-    tracker: SolveTracker,
-    env_config: EnvConfig,
-    agent_name: str,
-    resolved_model: str,
-    effective_max_parts: int,
-    part_counter: list[int],
-    git_commit_ref: list[str | None],
-    last_part_timestamp_ms_ref: list[int | None],
-    turn_record: TurnRecord | None,
-    session_id: str,
-    schedule_commit_evaluation: Callable[[str, int], None] | None = None,
-) -> Callable[[dict[str, Any]], Awaitable[None]]:
-    async def on_stream_part(stream_event: dict[str, Any]) -> None:
-        if turn_record is None:
-            return
-        if stream_event.get("event") != "part.completed":
-            return
-        if part_counter[0] >= effective_max_parts:
-            return
-
-        try:
-            part_counter[0] += 1
-            absolute_part = part_counter[0]
-            raw_files = stream_event.get("files")
-            files = (
-                [f for f in raw_files if isinstance(f, str) and f]
-                if isinstance(raw_files, list)
-                else []
-            )
-            part_type_value = stream_event.get("part_type")
-            part_type = part_type_value if isinstance(part_type_value, str) else None
-            item_type_value = stream_event.get("item_type")
-            item_type = item_type_value if isinstance(item_type_value, str) else None
-            summary_value = stream_event.get("summary")
-            summary = summary_value if isinstance(summary_value, str) and summary_value else None
-            content_value = stream_event.get("content")
-            content = content_value if isinstance(content_value, str) else None
-            tool_name_value = stream_event.get("tool_name")
-            tool_name = tool_name_value if isinstance(tool_name_value, str) else None
-            tool_status_value = stream_event.get("tool_status")
-            tool_status = tool_status_value if isinstance(tool_status_value, str) else None
-            tool_exit_code_value = stream_event.get("tool_exit_code")
-            tool_exit_code = (
-                tool_exit_code_value if isinstance(tool_exit_code_value, int) else None
-            )
-            token_usage_value = stream_event.get("token_usage")
-            token_usage = (
-                redact_secrets(token_usage_value)
-                if isinstance(token_usage_value, dict)
-                else None
-            )
-            provider_part_value = stream_event.get("provider_part")
-            provider_part = (
-                redact_secrets(provider_part_value)
-                if isinstance(provider_part_value, dict)
-                else None
-            )
-            provider_item_value = stream_event.get("provider_item")
-            provider_item = (
-                redact_secrets(provider_item_value)
-                if isinstance(provider_item_value, dict)
-                else None
-            )
-            provider_event_value = stream_event.get("provider_event")
-            provider_event = (
-                redact_secrets(provider_event_value)
-                if isinstance(provider_event_value, dict)
-                else None
-            )
-            tool_input = redact_secrets(stream_event.get("tool_input"))
-            tool_output = redact_secrets(stream_event.get("tool_output"))
-            tool_error = redact_secrets(stream_event.get("tool_error"))
-            role_value = stream_event.get("role")
-            role: Literal["assistant", "user"] = (
-                role_value
-                if role_value in {"assistant", "user"}
-                else "assistant"
-            )
-            event_timestamp_ms_value = stream_event.get("timestamp_ms")
-            event_timestamp_ms = (
-                event_timestamp_ms_value
-                if isinstance(event_timestamp_ms_value, int)
-                else int(time.time() * 1000)
-            )
-            prev_ts = last_part_timestamp_ms_ref[0]
-            duration_ms = (
-                event_timestamp_ms - prev_ts
-                if isinstance(prev_ts, int) and event_timestamp_ms >= prev_ts
-                else None
-            )
-            last_part_timestamp_ms_ref[0] = event_timestamp_ms
-            has_file_change = bool(stream_event.get("has_file_change"))
-            changed_files = await get_changed_files(sb)
-            detected_file_change = bool(changed_files)
-            checkpoint: RepoCheckpoint | None = None
-            should_checkpoint = has_file_change or detected_file_change
-            if should_checkpoint:
-                if not has_file_change:
-                    print(
-                        "[stream] corrected has_file_change=false with git dirty "
-                        f"state on part {absolute_part}"
-                    )
-                checkpoint = await create_part_checkpoint(
-                    sb=sb,
-                    trajectory_id=trajectory_id,
-                    part=absolute_part,
-                    changed_files_hint=(changed_files or files),
-                    commit_before_hint=git_commit_ref[0],
-                )
-                if (
-                    has_file_change
-                    and not checkpoint.committed
-                    and not detected_file_change
-                ):
-                    print(
-                        "[git] part signaled file change but git was clean; "
-                        f"recorded metadata only on part {absolute_part}"
-                    )
-                if files and not checkpoint.changed_files:
-                    checkpoint.changed_files = files
-                if checkpoint.changed_files and not files:
-                    files = list(checkpoint.changed_files)
-                git_commit_ref[0] = (
-                    checkpoint.commit_after
-                    or checkpoint.commit_before
-                    or git_commit_ref[0]
-                )
-                if (
-                    checkpoint.committed
-                    and isinstance(checkpoint.commit_after, str)
-                    and checkpoint.commit_after
-                    and schedule_commit_evaluation is not None
-                ):
-                    schedule_commit_evaluation(checkpoint.commit_after, absolute_part)
-
-            part_envoi_calls: list[EnvoiCall] = []
-            raw_test_call = stream_event.get("test_call")
-            if isinstance(raw_test_call, dict):
-                try:
-                    part_envoi_calls.append(EnvoiCall(**raw_test_call))
-                except Exception:
-                    pass
-            if part_envoi_calls:
-                tracker.update(part_envoi_calls)
-
-            part_record = PartRecord(
-                trajectory_id=trajectory_id,
-                session_id=session_id,
-                agent=agent_name,
-                part=absolute_part,
-                timestamp=iso_from_epoch_ms(event_timestamp_ms),
-                role=role,
-                part_type=part_type,
-                item_type=item_type,
-                summary=summary,
-                duration_ms=duration_ms,
-                agent_model=resolved_model,
-                git_commit=git_commit_ref[0],
-                files=files,
-                content=content,
-                summary_word_count=word_count(summary),
-                summary_token_estimate=token_estimate(summary),
-                content_word_count=word_count(content),
-                content_token_estimate=token_estimate(content),
-                tool_name=tool_name,
-                tool_status=tool_status,
-                tool_input=tool_input,
-                tool_output=tool_output,
-                tool_error=tool_error,
-                tool_exit_code=tool_exit_code,
-                token_usage=token_usage,
-                provider_part=provider_part,
-                provider_item=provider_item,
-                provider_event=provider_event,
-                patch=checkpoint.patch if checkpoint else None,
-                envoi_calls=part_envoi_calls,
-                testing_state=tracker.snapshot(),
-                repo_checkpoint=checkpoint,
-            )
-            turn_record.parts.append(part_record)
-            agent_trace.parts.append(part_record)
-            if turn_record.part_start is None:
-                turn_record.part_start = absolute_part
-            turn_record.part_end = absolute_part
-            turn_record.git_commit = git_commit_ref[0]
-            if checkpoint is not None:
-                turn_record.repo_checkpoint = checkpoint
-            save_trace_parquet(trajectory_id, agent_trace, env_config)
-        except Exception as callback_err:
-            print(f"[stream] failed to process live part event: {callback_err}")
-
-    return on_stream_part
-
-
-# ---------------------------------------------------------------------------
 # End session
 # ---------------------------------------------------------------------------
 
@@ -2300,28 +631,46 @@ async def _run_trajectory_impl(
                 setup_script=setup_script, env_files=env_files,
             )
 
-        resume_commit = get_trace_latest_commit(existing_trace) if existing_trace else None
-        if existing_trace is not None and isinstance(resume_commit, str) and resume_commit:
+        resume_commit = (
+            get_trace_latest_commit(existing_trace)
+            if existing_trace
+            else None
+        )
+        if (
+            existing_trace is not None
+            and isinstance(resume_commit, str)
+            and resume_commit
+        ):
             await restore_workspace_from_bundle(
                 sb=sb,
                 trajectory_id=trajectory_id,
                 commit=resume_commit,
             )
 
-        if agent == "opencode":
-            session_id = await opencode_create_session(
-                sb, title=f"trajectory-{trajectory_id}",
-            )
-        else:
-            session_id = f"pending-{trajectory_id}"
-        if not session_id:
-            raise RuntimeError(f"Failed to create session for agent={agent}")
-
-        if agent == "opencode":
-            await opencode_ensure_provider_connected(sb, agent_api_key)
+        # --- Create agent backend and session ---
+        agent_cls = AGENT_BACKENDS.get(agent)
+        if agent_cls is None:
+            raise ValueError(f"Unknown agent: {agent}")
+        agent_backend: AgentBackend = agent_cls()
         codex_api_key_file = (
-            "/tmp/upload/codex_api_key.txt" if agent == "codex" and agent_api_key else None
+            "/tmp/upload/codex_api_key.txt"
+            if agent == "codex" and agent_api_key
+            else None
         )
+        await agent_backend.start(
+            sb=sb,
+            model=resolved_model,
+            api_key=agent_api_key,
+            auth_json=codex_auth_json,
+            api_key_file=codex_api_key_file,
+        )
+        session_id = await agent_backend.create_session(
+            trajectory_id,
+        )
+        if not session_id:
+            raise RuntimeError(
+                f"Failed to create session for agent={agent}",
+            )
 
         if existing_trace is not None:
             agent_trace = existing_trace
@@ -2532,7 +881,6 @@ async def _run_trajectory_impl(
         tracker = SolveTracker(list(env_config.required_test_paths))
         for part_record in agent_trace.parts:
             tracker.update(list(part_record.envoi_calls))
-        seen_message_ids: set[str] = set()
         def _followup() -> str:
             status = build_unsolved_status_lines(tracker)
             if not status:
@@ -2625,22 +973,11 @@ async def _run_trajectory_impl(
                 )
 
                 # Send message and BLOCK until agent finishes
-                run_turn_fn = (
-                    opencode_run_turn
-                    if agent == "opencode"
-                    else codex_run_turn
-                )
-                turn_outcome = await run_turn_fn(
-                    sb=sb,
-                    session_id=session_id,
-                    model=resolved_model,
+                turn_outcome = await agent_backend.run_turn(
                     prompt_text=prompt_text,
-                    seen_message_ids=seen_message_ids,
                     timeout=turn_timeout_seconds,
                     remaining_parts_budget=per_call_parts_budget,
                     on_stream_part=stream_part_cb,
-                    **({"api_key_file": codex_api_key_file}
-                       if agent == "codex" else {}),
                 )
                 part_count = stream_part_counter[0]
                 git_commit = stream_git_commit_ref[0]
@@ -2655,14 +992,12 @@ async def _run_trajectory_impl(
                     )
                     await dump_sandbox_logs(sb, agent=agent)
                     if consecutive_turn_failures <= TURN_RECOVERY_RETRIES:
-                        if agent == "opencode":
-                            recovered_session_id = await opencode_create_session(
-                                sb, title=f"trajectory-{trajectory_id}",
+                        recovered_session_id = (
+                            await agent_backend.recover_session(
+                                trajectory_id,
+                                consecutive_turn_failures,
                             )
-                        else:
-                            recovered_session_id = (
-                                f"recovery-{trajectory_id}-{consecutive_turn_failures}"
-                            )
+                        )
                         if recovered_session_id:
                             session_id = recovered_session_id
                             agent_trace.session_id = recovered_session_id
@@ -2672,6 +1007,7 @@ async def _run_trajectory_impl(
                     end_reason = "agent_error"
                     break
                 consecutive_turn_failures = 0
+                agent_backend.on_turn_complete(turn_outcome)
 
                 response = turn_outcome.response
                 session_id = turn_outcome.session_id
@@ -2771,10 +1107,16 @@ async def _run_trajectory_impl(
             end_reason = "agent_error"
             # Save whatever messages we have
             try:
-                if agent == "opencode":
+                if (
+                    agent_backend.name == "opencode"
+                    and hasattr(
+                        agent_backend,
+                        "_collect_turn_messages",
+                    )
+                ):
                     _, _, crash_new_messages = (
-                        await opencode_collect_turn_messages(
-                            sb, session_id, seen_message_ids,
+                        await agent_backend._collect_turn_messages(
+                            session_id,
                         )
                     )
                 else:

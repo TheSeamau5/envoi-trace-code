@@ -879,3 +879,523 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+# -------------------------------------------------------------------
+# OpenCodeAgent: AgentBackend implementation (runner-side only)
+# -------------------------------------------------------------------
+# The code below is only executed when imported by runner.py, never
+# when this file runs as a standalone sandbox script.
+
+try:
+    import builtins as _builtins
+
+    from agents.base import AgentTurnOutcome as _AgentTurnOutcome
+    from sandbox.base import SandboxBackend as _SandboxBackend
+    from utils.helpers import run_sandbox_client as _run_sandbox_client
+    from utils.parsing import (
+        agent_message_id as _agent_message_id,
+    )
+    from utils.parsing import (
+        parse_trace_event_line as _parse_trace_event_line,
+    )
+
+    _OPENCODE_SCRIPT = "/sandbox/opencode_client.py"
+    _OPENCODE_LABEL = "opencode-sdk"
+
+    class OpenCodeAgent:
+        """AgentBackend implementation for OpenCode."""
+
+        @property
+        def name(self) -> str:
+            return "opencode"
+
+        @property
+        def session_id(self) -> str | None:
+            return self._session_id
+
+        def __init__(self) -> None:
+            self._sb: _SandboxBackend | None = None
+            self._model: str = ""
+            self._api_key: str = ""
+            self._session_id: str | None = None
+            self._seen_message_ids: set[str] = set()
+
+        # -- helpers ------------------------------------------------
+
+        async def _run_client(
+            self,
+            args: list[str],
+            *,
+            timeout: int = 60,
+            quiet: bool = False,
+            stream_output: bool = False,
+            on_stderr_line=None,
+        ) -> dict[str, Any] | None:
+            assert self._sb is not None
+            return await _run_sandbox_client(
+                self._sb,
+                _OPENCODE_SCRIPT,
+                _OPENCODE_LABEL,
+                args,
+                timeout=timeout,
+                quiet=quiet,
+                stream_output=stream_output,
+                on_stderr_line=on_stderr_line,
+            )
+
+        # -- protocol methods ---------------------------------------
+
+        async def start(
+            self,
+            *,
+            sb: _SandboxBackend,
+            model: str,
+            api_key: str,
+            setup_script: str = "",
+            env_files=None,
+            **kwargs: Any,
+        ) -> None:
+            self._sb = sb
+            self._model = model
+            self._api_key = api_key
+            await self._ensure_provider_connected()
+
+        async def _ensure_provider_connected(self) -> None:
+            assert self._sb is not None
+            response = await self._run_client(
+                ["provider-status"],
+                timeout=30,
+                quiet=True,
+            )
+            if (
+                response
+                and response.get("ok")
+                and isinstance(response.get("body"), dict)
+            ):
+                connected = response["body"].get(
+                    "connected", [],
+                )
+                _builtins.print(
+                    f"[provider] connected={connected}",
+                    flush=True,
+                )
+                if (
+                    isinstance(connected, list)
+                    and "opencode" in connected
+                ):
+                    return
+
+            _builtins.print(
+                "[provider] opencode not connected, "
+                "setting auth...",
+                flush=True,
+            )
+            api_key_path = "/tmp/auth_opencode_api_key.txt"
+            await self._sb.write_file(
+                api_key_path,
+                self._api_key,
+                ensure_dir=False,
+            )
+            auth_response = await self._run_client(
+                [
+                    "provider-auth",
+                    "--api-key-file",
+                    api_key_path,
+                ],
+                timeout=30,
+            )
+            if (
+                auth_response is None
+                or not auth_response.get("ok")
+            ):
+                raise RuntimeError(
+                    "Failed to authenticate provider: "
+                    f"{auth_response}",
+                )
+
+        async def create_session(
+            self,
+            trajectory_id: str,
+        ) -> str:
+            assert self._sb is not None
+            title = f"trajectory-{trajectory_id}"
+            response = await self._run_client(
+                ["create-session", "--title", title],
+                timeout=60,
+            )
+            if response is None:
+                raise RuntimeError(
+                    "Failed to create session: no response",
+                )
+            if not response.get("ok"):
+                raise RuntimeError(
+                    "Failed to create session: "
+                    f"{response.get('error')}",
+                )
+            body = response.get("body", {})
+            sid = (
+                body.get("id")
+                if isinstance(body, dict)
+                else None
+            )
+            _builtins.print(
+                f"[session] created id={sid}", flush=True,
+            )
+            self._session_id = sid or ""
+            return self._session_id
+
+        async def _get_all_messages(
+            self,
+            session_id: str,
+        ) -> list[dict[str, Any]]:
+            assert self._sb is not None
+            response = await self._run_client(
+                [
+                    "list-messages",
+                    "--session-id",
+                    session_id,
+                ],
+                timeout=60,
+                quiet=True,
+            )
+            if response is None or not response.get("ok"):
+                return []
+            body = response.get("body")
+            if isinstance(body, list):
+                return body
+            if isinstance(body, dict):
+                for key in (
+                    "items",
+                    "messages",
+                    "data",
+                    "results",
+                ):
+                    value = body.get(key)
+                    if isinstance(value, list):
+                        return value
+            return []
+
+        async def _get_all_sessions(
+            self,
+        ) -> list[dict[str, Any]]:
+            assert self._sb is not None
+            response = await self._run_client(
+                ["list-sessions"], timeout=60, quiet=True,
+            )
+            if response is None or not response.get("ok"):
+                return []
+            body = response.get("body")
+            if isinstance(body, list):
+                return body
+            if isinstance(body, dict):
+                for key in (
+                    "items",
+                    "sessions",
+                    "data",
+                    "results",
+                ):
+                    value = body.get(key)
+                    if isinstance(value, list):
+                        return value
+            return []
+
+        async def _collect_turn_messages(
+            self,
+            root_session_id: str,
+        ) -> tuple[
+            list[dict[str, Any]],
+            list[str],
+            list[dict[str, Any]],
+        ]:
+            sessions = await self._get_all_sessions()
+            session_ids = _get_session_family(
+                root_session_id, sessions,
+            )
+            session_map: dict[str, dict[str, Any]] = {}
+            for s in sessions:
+                if not isinstance(s, dict):
+                    continue
+                sid = _session_object_id(s)
+                if sid and sid in session_ids:
+                    session_map[sid] = s
+
+            message_results = await asyncio.gather(
+                *[
+                    self._get_all_messages(sid)
+                    for sid in session_ids
+                ],
+            )
+
+            all_messages: list[dict[str, Any]] = []
+            for sid, messages in zip(
+                session_ids,
+                message_results,
+                strict=False,
+            ):
+                for message in messages:
+                    if not isinstance(message, dict):
+                        continue
+                    info = message.setdefault("info", {})
+                    if "sessionID" not in info:
+                        info["sessionID"] = sid
+                    all_messages.append(message)
+
+            all_messages.sort(key=_message_created_ms)
+
+            new_messages: list[dict[str, Any]] = []
+            for message in all_messages:
+                mid = _agent_message_id(message)
+                if mid and mid in self._seen_message_ids:
+                    continue
+                if mid:
+                    self._seen_message_ids.add(mid)
+                new_messages.append(message)
+
+            session_objects = [
+                session_map[sid]
+                for sid in session_ids
+                if sid in session_map
+            ]
+            return session_objects, session_ids, new_messages
+
+        async def _send_message_blocking(
+            self,
+            text: str,
+            timeout: int,
+            remaining_parts_budget: int,
+            on_stream_part=None,
+        ) -> dict[str, Any] | None:
+            assert self._sb is not None
+            prompt_path = "/tmp/prompt.txt"
+            await self._sb.write_file(
+                prompt_path, text, ensure_dir=False,
+            )
+            _builtins.print(
+                f"[prompt] sending message ({len(text)} "
+                f"chars), waiting up to {timeout}s...",
+                flush=True,
+            )
+
+            async def handle_stderr_line(
+                line: str,
+            ) -> None:
+                await _parse_trace_event_line(
+                    line, on_stream_part,
+                )
+
+            response = await self._run_client(
+                [
+                    "chat-stream",
+                    "--session-id",
+                    self._session_id or "",
+                    "--text-file",
+                    prompt_path,
+                    "--max-parts",
+                    str(remaining_parts_budget),
+                ],
+                timeout=timeout,
+                stream_output=True,
+                on_stderr_line=handle_stderr_line,
+            )
+            if response is None:
+                return None
+
+            status_code = response.get("status_code")
+            ok = bool(response.get("ok"))
+            body = response.get("body")
+            meta = response.get("meta")
+            meta_obj = (
+                meta if isinstance(meta, dict) else {}
+            )
+            aborted_for_part_limit = bool(
+                meta_obj.get("aborted_for_part_limit"),
+            )
+            _builtins.print(
+                f"[prompt] done http={status_code} ok={ok}",
+                flush=True,
+            )
+
+            if not ok:
+                if aborted_for_part_limit:
+                    _builtins.print(
+                        "[prompt] part limit reached during "
+                        "stream; ending current turn",
+                        flush=True,
+                    )
+                    if isinstance(body, dict):
+                        stream_meta = body.get("_stream")
+                        stream_obj = (
+                            stream_meta
+                            if isinstance(stream_meta, dict)
+                            else {}
+                        )
+                        stream_obj.update(meta_obj)
+                        body["_stream"] = stream_obj
+                        return body
+                    return {"_stream": dict(meta_obj)}
+                error_text = str(
+                    response.get("error") or body,
+                )
+                if len(error_text) > 1000:
+                    error_text = (
+                        error_text[:1000]
+                        + "...[truncated]"
+                    )
+                _builtins.print(
+                    f"[prompt] ERROR: {error_text}",
+                    flush=True,
+                )
+                return None
+
+            if not isinstance(body, dict):
+                if aborted_for_part_limit:
+                    return {"_stream": dict(meta_obj)}
+                _builtins.print(
+                    "[prompt] unexpected response type: "
+                    f"{type(body).__name__}",
+                    flush=True,
+                )
+                return None
+
+            stream_meta = body.get("_stream")
+            stream_obj = (
+                stream_meta
+                if isinstance(stream_meta, dict)
+                else {}
+            )
+            stream_obj.update(meta_obj)
+            body["_stream"] = stream_obj
+            return body
+
+        async def run_turn(
+            self,
+            *,
+            prompt_text: str,
+            timeout: int,
+            remaining_parts_budget: int,
+            on_stream_part=None,
+        ) -> _AgentTurnOutcome | None:
+            response = await self._send_message_blocking(
+                prompt_text,
+                timeout=timeout,
+                remaining_parts_budget=remaining_parts_budget,
+                on_stream_part=on_stream_part,
+            )
+            if response is None:
+                return None
+            (
+                session_objects,
+                session_ids,
+                new_messages,
+            ) = await self._collect_turn_messages(
+                self._session_id or "",
+            )
+            return _AgentTurnOutcome(
+                session_id=self._session_id or "",
+                response=response,
+                session_objects=session_objects,
+                session_ids=session_ids,
+                new_messages=new_messages,
+            )
+
+        def on_turn_complete(
+            self,
+            outcome: _AgentTurnOutcome,
+        ) -> None:
+            self._session_id = outcome.session_id
+
+        def on_resume(
+            self,
+            existing_messages: list[dict[str, Any]],
+        ) -> None:
+            for msg in existing_messages:
+                mid = _agent_message_id(msg)
+                if mid:
+                    self._seen_message_ids.add(mid)
+
+        async def recover_session(
+            self,
+            trajectory_id: str,
+            attempt: int,
+        ) -> str:
+            return await self.create_session(trajectory_id)
+
+        async def stop(self) -> None:
+            pass
+
+    # Module-level helpers for session tree walking
+    def _session_object_id(
+        session: dict[str, Any],
+    ) -> str | None:
+        for key in ("id", "sessionID", "session_id"):
+            value = session.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    def _session_object_parent_id(
+        session: dict[str, Any],
+    ) -> str | None:
+        for key in (
+            "parentID",
+            "parent_id",
+            "parentId",
+        ):
+            value = session.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    def _get_session_family(
+        root_session_id: str,
+        sessions: list[dict[str, Any]],
+    ) -> list[str]:
+        known_ids = {
+            sid
+            for s in sessions
+            if isinstance(s, dict)
+            if (sid := _session_object_id(s))
+        }
+        if root_session_id not in known_ids:
+            return [root_session_id]
+
+        children_by_parent: dict[str, list[str]] = {}
+        for s in sessions:
+            if not isinstance(s, dict):
+                continue
+            sid = _session_object_id(s)
+            parent_id = _session_object_parent_id(s)
+            if sid and parent_id:
+                children_by_parent.setdefault(
+                    parent_id, [],
+                ).append(sid)
+
+        family: list[str] = []
+        queue = [root_session_id]
+        seen: set[str] = set()
+        while queue:
+            current = queue.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            family.append(current)
+            queue.extend(
+                children_by_parent.get(current, []),
+            )
+        return family
+
+    def _message_created_ms(
+        message: dict[str, Any],
+    ) -> int:
+        info = message.get("info", {})
+        time_info = info.get("time", {})
+        created = time_info.get("created")
+        return (
+            int(created)
+            if isinstance(created, int)
+            else 0
+        )
+
+except ImportError:
+    pass  # Running as standalone sandbox script
